@@ -36,6 +36,7 @@ from pathlib import Path
 
 import pandas as pd
 import psycopg2
+import psycopg2.extras
 from dotenv import load_dotenv
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -80,10 +81,15 @@ def copy_table(local_conn, sb_conn, table: str, query: str, params: dict | None 
         + ", ".join(f"{c} = EXCLUDED.{c}" for c in update_cols)
         if update_cols else f"ON CONFLICT ({', '.join(pk_cols)}) DO NOTHING"
     )
-    sql = f"INSERT INTO {table} ({col_list}) VALUES ({placeholders}) {conflict_clause}"
+    # execute_values batches many rows per round trip - a naive executemany()
+    # was measured at ~108ms/row over the Supabase session pooler (network
+    # round-trip bound, not data-volume bound) - ~13min just for the ohlcv
+    # table at that rate. Batched, the whole migration is single-digit seconds.
+    sql = f"INSERT INTO {table} ({col_list}) VALUES %s {conflict_clause}"
+    df = df.astype(object).where(df.notna(), None)  # pandas NaT/NaN -> SQL NULL (psycopg2 can't serialize NaT)
     rows = [tuple(r) for r in df.itertuples(index=False, name=None)]
     with sb_conn.cursor() as cur:
-        cur.executemany(sql, rows)
+        psycopg2.extras.execute_values(cur, sql, rows, page_size=1000)
     sb_conn.commit()
     print(f"  {table}: {len(df)} rows copied")
 
