@@ -78,7 +78,9 @@ from strategy import (
     load_events_with_returns, generate_signals, compute_score_series,
 )
 from telegram_notify import send_alert
-from bybit_balance import get_full_balance
+from bybit_balance import get_full_balance, get_coin_balance
+
+NO_REAL_BALANCE_EPS = 1e-8  # below this, treat the real coin balance as "nothing to sell"
 
 STOP_LOSS = -0.08
 TREND_FILTER_SMA = 720
@@ -354,7 +356,19 @@ def process_symbol(conn, client, mode: str, symbol: str, events: pd.DataFrame, d
     log_tick(conn, symbol, score, is_long_target, False, f"exit_{exit_reason}",
              f"order {order_id} @ {exit_price}, net_ret {net_ret:.4f}")
     print(f"[{symbol}] EXITED ({exit_reason}) at {exit_price}, net_ret {net_ret:.2%}, order {order_id}")
-    send_alert(_exit_alert_text(symbol, exit_price, exit_reason, net_ret, mode))
+
+    # Suppress the sell alert specifically when the user demonstrably has
+    # nothing real to sell (2026-09-15, per user request) - the bot's own
+    # paper position can diverge from what was actually bought on past
+    # entry alerts. Only suppress on a DEFINITIVE zero; None (creds
+    # missing/API hiccup) still sends, so an unverifiable balance never
+    # silently hides a real signal. Entry alerts are NEVER suppressed this
+    # way - "time to buy" is actionable regardless of current holdings.
+    real_balance = get_coin_balance(symbol.replace("USDT", ""))
+    if real_balance is not None and real_balance < NO_REAL_BALANCE_EPS:
+        print(f"[{symbol}] exit alert suppressed - no real balance to sell ({real_balance})")
+    else:
+        send_alert(_exit_alert_text(symbol, exit_price, exit_reason, net_ret, mode))
 
 
 def main():

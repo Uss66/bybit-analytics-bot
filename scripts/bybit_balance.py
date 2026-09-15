@@ -134,6 +134,38 @@ def get_full_balance() -> dict | None:
         return None
 
 
+def get_coin_balance(coin: str) -> float | None:
+    """Real mainnet balance of a given coin (e.g. 'BTC'), summed across
+    Unified + Funding wallets - added 2026-09-15 so exit alerts can check
+    "does the user actually hold this coin at all" before suggesting a
+    sell, since the bot's own testnet_state (paper positions) can diverge
+    from what the user actually bought on past entry alerts (they may not
+    have acted on every signal, or already sold manually outside the
+    bot). Returns None (not 0) if credentials are missing or the call
+    fails - callers must treat None as 'unknown, don't suppress the
+    alert', never as 'confirmed zero', so a transient API hiccup never
+    silently hides a real actionable signal."""
+    if not API_KEY or not API_SECRET:
+        return None
+    try:
+        total = 0.0
+        unified = _get("/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": coin})
+        for account in unified.get("list", []):
+            for c in account.get("coin", []):
+                if c.get("coin") == coin:
+                    total += float(c.get("walletBalance") or 0)
+
+        funding = _get("/v5/asset/transfer/query-account-coins-balance", {"accountType": "FUND"})
+        for c in funding.get("balance", []):
+            if c.get("coin") == coin:
+                total += float(c.get("walletBalance") or 0)
+
+        return total
+    except (requests.exceptions.RequestException, RuntimeError) as e:
+        print(f"[bybit_balance] coin balance check failed for {coin} (non-fatal): {e}")
+        return None
+
+
 if __name__ == "__main__":
     full = get_full_balance()
     if full is None:
