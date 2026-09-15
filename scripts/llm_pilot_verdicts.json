@@ -1,0 +1,242 @@
+[
+  {
+    "pilot_id": "T001",
+    "verdict": "CONFIRM",
+    "confidence": 4,
+    "reason": "Extreme-greed backdrop (FGI 93-94) with strong bullish tailwinds: $1B+ BTC spot ETF inflows, crypto-friendly Trump cabinet picks (Bessent as Treasury Secretary), SEC leadership resignations read as a bullish deregulation signal, and BTC/SOL hitting new all-time highs, with no negative catalysts in the feed."
+  },
+  {
+    "pilot_id": "T002",
+    "verdict": "CONFIRM",
+    "confidence": 3,
+    "reason": "Institutional adoption remains strong (Strategy's $4.2B ATM offering, CoreWeave-Core Scientific deal, continued BTC/ETH ETF inflows) and Tornado Cash sanctions were dropped, though a broad wave of new Trump tariffs across many countries and a DVOL spike add genuine macro caution."
+  },
+  {
+    "pilot_id": "T003",
+    "verdict": "CONFIRM",
+    "confidence": 3,
+    "reason": "No notable news beyond regime tags: fear-zone sentiment and a weakening dollar (DXY down extreme), which is typically mildly supportive for crypto, with no negative catalyst present."
+  },
+  {
+    "pilot_id": "T004",
+    "verdict": "VETO",
+    "confidence": 4,
+    "reason": "Feed is dominated by the fallout from the record $1.4-1.5B Bybit hack (the largest crypto exchange heist ever), including unresolved questions about how the attacker gained access, ongoing hacker fund laundering, and a mixer refusing cooperation with the exchange -- a genuine security/contagion risk event even though Bybit's liquidity was ultimately restored."
+  },
+  {
+    "pilot_id": "T005",
+    "verdict": "CONFIRM",
+    "confidence": 4,
+    "reason": "Strongly bullish backdrop: record spot ETH ETF inflows (~$1B in a day), the SEC formally ended its Ripple lawsuit, in-line CPI supporting rate-cut hopes, heavy institutional BTC/ETH treasury buying (Metaplanet, BitMine, Block), and total crypto market cap at an all-time high; the only negative item (a Monero-specific 51% attack) is unrelated to ETH."
+  },
+  {
+    "pilot_id": "T006",
+    "verdict": "CONFIRM",
+    "confidence": 3,
+    "reason": "No notable news; only regime tags -- greed-zone sentiment and a weakening dollar are mildly supportive, with a DVOL spike as a minor volatility caution but no negative catalyst."
+  },
+  {
+    "pilot_id": "T007",
+    "verdict": "CONFIRM",
+    "confidence": 3,
+    "reason": "No notable news; only a greed-zone sentiment reading and a volatility-spike tag, with no negative catalyst identified."
+  },
+  {
+    "pilot_id": "T008",
+    "verdict": "CONFIRM",
+    "confidence": 3,
+    "reason": "No notable news; only a greed-zone sentiment reading and a volatility-spike tag, with no negative catalyst identified."
+  },
+  {
+    "pilot_id": "T009",
+    "verdict": "CONFIRM",
+    "confidence": 4,
+    "reason": "Same extreme-greed, strongly bullish market-wide backdrop as the other Nov-24-2024 entries: record ETF inflows, crypto-friendly Trump cabinet appointments, SEC turnover read as bullish deregulation, BTC/SOL at all-time highs, no negative catalysts."
+  },
+  {
+    "pilot_id": "T010",
+    "verdict": "CONFIRM",
+    "confidence": 4,
+    "reason": "Same extreme-greed, strongly bullish market-wide backdrop as the other Nov-24-2024 entries: record ETF inflows, crypto-friendly Trump cabinet appointments, SEC turnover read as bullish deregulation, BTC/SOL at all-time highs, no negative catalysts."
+  },
+  {
+    "pilot_id": "T011",
+    "verdict": "CONFIRM",
+    "confidence": 3,
+    "reason": "No notable news; only regime tags -- extreme-fear sentiment and a weakening dollar, with no specific negative catalyst identified in the feed."
+  },
+  {
+    "pilot_id": "T012",
+    "verdict": "CONFIRM",
+    "confidence": 4,
+    "reason": "Same extreme-greed, strongly bullish market-wide backdrop as the other Nov-24-2024 entries, plus an XRP-specific positive (Wisdomtree's physical XRP ETP launch in Europe); no negative catalysts."
+  },
+  {
+    "pilot_id": "T013",
+    "verdict": "CONFIRM",
+    "confidence": 3,
+    "reason": "No notable news; only an extreme-greed sentiment reading and a volatility-spike tag, with no negative catalyst identified."
+  },
+  {
+    "pilot_id": "T014",
+    "verdict": "CONFIRM",
+    "confidence": 3,
+    "reason": "No notable news; only regime tags -- extreme-fear sentiment and a weakening dollar, with no specific negative catalyst identified in the feed."
+  },
+  {
+    "pilot_id": "T015",
+    "verdict": "CONFIRM",
+    "confidence": 4,
+    "reason": "Heavily bullish institutional backdrop: Trump Media's $2.5B Bitcoin treasury deal, Strategy buying $427M more BTC, a record $2.75B weekly BTC ETF inflow, and an EU tariff delay easing trade tension; the minor negatives present (a Coinbase data-breach lawsuit, Sui/Cetus hack aftermath) are not SOL-specific."
+  },
+  {
+    "pilot_id": "T016",
+    "verdict": "CONFIRM",
+    "confidence": 3,
+    "reason": "No notable news; only regime tags -- extreme-fear sentiment easing plus a weakening dollar, with no negative catalyst identified."
+  },
+  {
+    "pilot_id": "T017",
+    "verdict": "CONFIRM",
+    "confidence": 3,
+    "reason": "No notable news; only a fear-zone sentiment reading that is improving, with no negative catalyst identified."
+  },
+  {
+    "pilot_id": "T018",
+    "verdict": "VETO",
+    "confidence": 3,
+    "reason": "Feed contains two genuine risk-off items inside the 48h window: WazirX (a major exchange) reported unable to meet customer withdrawal requests after its hack, and QCP notes crypto dipped and triggered a ~$70M long liquidation cascade following a second assassination attempt on Trump; combined with BlackRock cautioning that Fed rate cuts 'will not be as deep as market expects' right before the FOMC decision, the setup skews cautious despite some dovish counter-signals (Warren, Dimon)."
+  },
+  {
+    "pilot_id": "T019",
+    "verdict": "CONFIRM",
+    "confidence": 3,
+    "reason": "No notable news; only regime tags -- greed-zone sentiment and a weakening dollar are mildly supportive, with no negative catalyst identified."
+  },
+  {
+    "pilot_id": "T020",
+    "verdict": "CONFIRM",
+    "confidence": 3,
+    "reason": "No notable news; only regime tags -- extreme-greed sentiment and a weakening dollar, with no negative catalyst identified (though the greed extreme is a mild caution)."
+  },
+  {
+    "pilot_id": "T021",
+    "verdict": "CONFIRM",
+    "confidence": 2,
+    "reason": "No notable news; only a neutral sentiment reading and a sharp but unexplained volatility spike, with no negative catalyst identified."
+  },
+  {
+    "pilot_id": "T022",
+    "verdict": "CONFIRM",
+    "confidence": 2,
+    "reason": "No notable news; only neutral sentiment, a weakening dollar, and volatility-spike tags, with no negative catalyst identified."
+  },
+  {
+    "pilot_id": "T023",
+    "verdict": "CONFIRM",
+    "confidence": 3,
+    "reason": "No notable news; only a fear-zone sentiment reading and a weakening dollar, with no negative catalyst identified."
+  },
+  {
+    "pilot_id": "T024",
+    "verdict": "CONFIRM",
+    "confidence": 2,
+    "reason": "No notable news; only a neutral sentiment reading and a volatility-spike tag, with no negative catalyst identified."
+  },
+  {
+    "pilot_id": "T025",
+    "verdict": "CONFIRM",
+    "confidence": 2,
+    "reason": "No notable news; only neutral sentiment and volatility-swing tags, with no negative catalyst identified."
+  },
+  {
+    "pilot_id": "T026",
+    "verdict": "CONFIRM",
+    "confidence": 3,
+    "reason": "No notable news; only regime tags -- extreme-greed sentiment and a weakening dollar are mildly supportive, with no negative catalyst identified."
+  },
+  {
+    "pilot_id": "T027",
+    "verdict": "CONFIRM",
+    "confidence": 3,
+    "reason": "No notable news; only a fear-zone sentiment reading and a weakening dollar, with no negative catalyst identified."
+  },
+  {
+    "pilot_id": "T028",
+    "verdict": "CONFIRM",
+    "confidence": 2,
+    "reason": "No notable news; only neutral sentiment and volatility-spike tags, with no negative catalyst identified."
+  },
+  {
+    "pilot_id": "T029",
+    "verdict": "CONFIRM",
+    "confidence": 3,
+    "reason": "Turbulent tariff-driven macro (China retaliation threats, an IMF global growth downgrade, Trump attacking Fed Chair Powell) resolves toward de-escalation by entry time (Trump signaling tariffs 'will come down substantially,' progress on US-India/Japan deals), alongside a strong pro-crypto regulatory tailwind (new SEC Chair Paul Atkins sworn in) and heavy institutional BTC buying (Strategy, Cantor Fitzgerald); net backdrop supportive despite the volatility."
+  },
+  {
+    "pilot_id": "T030",
+    "verdict": "CONFIRM",
+    "confidence": 3,
+    "reason": "No notable news; only a greed-zone sentiment reading and a volatility-spike tag, with no negative catalyst identified."
+  },
+  {
+    "pilot_id": "T031",
+    "verdict": "CONFIRM",
+    "confidence": 2,
+    "reason": "No notable news; only a fear-zone sentiment reading and a volatility-spike tag, with no negative catalyst identified."
+  },
+  {
+    "pilot_id": "T032",
+    "verdict": "CONFIRM",
+    "confidence": 3,
+    "reason": "No notable news; only regime tags -- extreme-fear sentiment easing plus a weakening dollar, with no negative catalyst identified."
+  },
+  {
+    "pilot_id": "T033",
+    "verdict": "CONFIRM",
+    "confidence": 3,
+    "reason": "Heavy institutional ETH/BTC treasury buying continues (SharpLink's $667M ETH purchase, KindlyMD's BTC purchase, Metaplanet, Strategy) and bullish long-term calls (Bernstein's $150-200K BTC target), though a record-large single-day ETH/BTC spot ETF outflow the day before entry is a momentum caution worth noting."
+  },
+  {
+    "pilot_id": "T034",
+    "verdict": "CONFIRM",
+    "confidence": 2,
+    "reason": "No notable news; only a neutral sentiment reading and a volatility-spike tag, with no negative catalyst identified."
+  },
+  {
+    "pilot_id": "T035",
+    "verdict": "CONFIRM",
+    "confidence": 2,
+    "reason": "No notable news; only a neutral sentiment reading and a volatility-spike tag, with no negative catalyst identified."
+  },
+  {
+    "pilot_id": "T036",
+    "verdict": "VETO",
+    "confidence": 2,
+    "reason": "Extreme-fear sentiment (FGI 20) combined with a strengthening dollar (DXY up extreme on both days) -- a macro combination previously linked to crypto downside -- with no offsetting positive catalyst anywhere in the feed."
+  },
+  {
+    "pilot_id": "T037",
+    "verdict": "CONFIRM",
+    "confidence": 2,
+    "reason": "No notable news; only neutral sentiment and a weakening dollar, with no negative catalyst identified."
+  },
+  {
+    "pilot_id": "T038",
+    "verdict": "CONFIRM",
+    "confidence": 2,
+    "reason": "No notable news; only a fear-zone sentiment reading, with no negative catalyst identified."
+  },
+  {
+    "pilot_id": "T039",
+    "verdict": "CONFIRM",
+    "confidence": 2,
+    "reason": "No notable news; feed is essentially empty aside from two neutral sentiment readings."
+  },
+  {
+    "pilot_id": "T040",
+    "verdict": "CONFIRM",
+    "confidence": 2,
+    "reason": "No notable news; only a neutral sentiment reading and volatility-spike tags, with no negative catalyst identified."
+  }
+]

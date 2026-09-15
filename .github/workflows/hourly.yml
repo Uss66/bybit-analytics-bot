@@ -1,0 +1,44 @@
+name: Hourly live trading tick
+
+# Replaces the home-PC Windows Task Scheduler job (run_hourly.ps1) - see
+# project_oracle_cloud_hosting memory / README "GitHub Actions + Supabase"
+# for why: Oracle Cloud's Always Free VM creation kept hitting regional
+# capacity shortages, so the bot moved to ephemeral GitHub Actions runs
+# against a Supabase Postgres instead of a persistent VM.
+#
+# Timed at :05, not :00, on GitHub's own advice - scheduled workflows can
+# be delayed during exact-hour load spikes across all of GitHub Actions.
+on:
+  schedule:
+    - cron: "5 * * * *"
+  workflow_dispatch: {}  # manual trigger, for testing without waiting for the clock
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - run: pip install -r requirements.txt
+
+      - name: Refresh live data + run trader
+        working-directory: scripts
+        env:
+          POSTGRES_HOST: ${{ secrets.POSTGRES_HOST }}
+          POSTGRES_PORT: ${{ secrets.POSTGRES_PORT }}
+          POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          BYBIT_API_KEY: ${{ secrets.BYBIT_API_KEY }}
+          BYBIT_API_SECRET: ${{ secrets.BYBIT_API_SECRET }}
+        run: |
+          python refresh_live_data.py
+          python testnet_trader.py --mode simulate
