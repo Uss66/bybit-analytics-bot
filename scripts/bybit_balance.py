@@ -51,6 +51,24 @@ RECV_WINDOW = "20000"
 
 API_KEY = os.environ.get("BYBIT_API_KEY")
 API_SECRET = os.environ.get("BYBIT_API_SECRET")
+_warned_missing_creds = False
+
+
+def _warn_missing_creds():
+    """One-time diagnostic print when BYBIT_API_KEY/SECRET aren't set -
+    added 2026-09-18 after telegram_commands.yml shipped without these two
+    secrets in its env block (copy-paste gap from hourly.yml) and every
+    balance check silently returned None with ZERO trace in the GitHub
+    Actions log, making the resulting 'не удалось проверить баланс'
+    advisor message look like a Bybit API problem instead of a missing-
+    secret one. Silent None is still the right return value (callers must
+    treat it as 'unknown', not '0'), but silent should not mean invisible
+    in the log too."""
+    global _warned_missing_creds
+    if not _warned_missing_creds:
+        print("[bybit_balance] BYBIT_API_KEY/BYBIT_API_SECRET not set - balance checks disabled "
+              "(if this is a GitHub Actions run, check the workflow's env: block has both secrets)")
+        _warned_missing_creds = True
 
 
 def _sign(payload: str, timestamp: str) -> str:
@@ -86,6 +104,7 @@ def get_usdt_balance() -> float | None:
     BYBIT_API_KEY/SECRET aren't configured or the call fails - callers
     must treat None as 'unknown, don't show a figure', never as 0."""
     if not API_KEY or not API_SECRET:
+        _warn_missing_creds()
         return None
     try:
         result = _get("/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": "USDT"})
@@ -111,6 +130,7 @@ def get_full_balance() -> dict | None:
     reading only a Unified balance of 0 would wrongly conclude they have
     nothing, exactly what happened here before this was added."""
     if not API_KEY or not API_SECRET:
+        _warn_missing_creds()
         return None
     try:
         unified = _get("/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": "USDT"})
@@ -146,6 +166,7 @@ def get_coin_balance(coin: str) -> float | None:
     alert', never as 'confirmed zero', so a transient API hiccup never
     silently hides a real actionable signal."""
     if not API_KEY or not API_SECRET:
+        _warn_missing_creds()
         return None
     try:
         total = 0.0
