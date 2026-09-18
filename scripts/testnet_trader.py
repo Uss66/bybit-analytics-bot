@@ -87,6 +87,21 @@ TREND_FILTER_SMA = 720
 COOLDOWN_AFTER_LOSSES = 3
 COOLDOWN_HOURS = 168
 USDT_PER_TRADE = 100.0  # fixed paper-money position size per entry
+
+# Dip-rebuy add-on (2026-09-18) - VALIDATED, see project_dip_rebuy_findings
+# memory: while a position is held, add a tranche when price has dropped
+# DIP_REBUY_THRESHOLD below the position's average cost AND has since
+# recovered DIP_REBUY_REBOUND off that running low (a CONFIRMED bounce,
+# not just "still falling"). Beat the no-add baseline on holdout return in
+# all 7 symbols, drawdown in 6/7, zero exceptions - dip3_bounce2 was the
+# parameterization used, dip5_bounce3 was weaker/noisier and NOT the one
+# validated for live use. Mechanically the OPPOSITE of the already-
+# rejected add-on-STRENGTH pyramiding (project_pyramiding_findings) -
+# adding at a LOWER price than average pulls the average DOWN, widening
+# (not tightening) the stop's effective distance.
+DIP_REBUY_THRESHOLD = -0.03
+DIP_REBUY_REBOUND = 0.02
+DIP_REBUY_MAX_ADDS = 2
 MAX_POSITIONS = 3  # portfolio-wide cap on simultaneous open positions, added 2026-09-13 -
 # validated via strategy.py's simulate_portfolio() on the full extended history: best
 # risk-adjusted (return/drawdown) ratio of any cap on BOTH train (4.94x) and holdout
@@ -148,6 +163,16 @@ def record_trade(conn, symbol, entry_ts, exit_ts, entry_price, exit_price, qty,
             """,
             (symbol, entry_ts, exit_ts, entry_price, exit_price, qty, gross_ret, net_ret,
              exit_reason, entry_order_id, exit_order_id),
+        )
+    conn.commit()
+
+
+def record_tranche(conn, symbol, tranche_num, price, qty, order_id):
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO testnet_position_tranches (symbol, tranche_num, price, qty, order_id) "
+            "VALUES (%s, %s, %s, %s, %s)",
+            (symbol, tranche_num, price, qty, order_id),
         )
     conn.commit()
 
@@ -215,6 +240,85 @@ def _exit_alert_text(symbol: str, exit_price: float, exit_reason: str, net_ret: 
     )
 
 
+def _add_alert_text(symbol: str, fill_price: float, fill_qty: float, new_avg_cost: float,
+                     tranche_count: int, mode: str) -> str:
+    base_coin = symbol.replace("USDT", "")
+    new_stop_price = new_avg_cost * (1 + STOP_LOSS)
+    mode_note = "бумажная сделка (симулятор)" if mode == "simulate" else f"реальный ордер размещён в режиме {mode}"
+    return (
+        f"\U0001F53C ДОКУПКА (транш {tranche_count}) — {symbol}\n\n"
+        f"Просадка от средней подтверждённо отскочила — стратегия докупает.\n"
+        f"Цена докупки: {fill_price:,.6g} USDT\n"
+        f"Статус: {mode_note}{_balance_line()}\n\n"
+        f"Что делать, если торгуешь реальными деньгами:\n"
+        f"1. Открой Bybit → Spot → {symbol}\n"
+        f"2. Рыночный ордер BUY на ~{USDT_PER_TRADE:.0f} USDT "
+        f"(≈{fill_qty:.6g} {base_coin} по текущей цене)\n"
+        f"3. Новая средняя цена всей позиции: {new_avg_cost:,.6g} USDT — "
+        f"обновлённый ориентировочный стоп-лосс: {new_stop_price:,.6g} USDT (−8% от новой средней)"
+    )
+
+
+def maybe_add_tranche(conn, client, mode: str, symbol: str, state: dict, price: float, dry_run: bool):
+    """Dip-rebuy add-on check (2026-09-18) - see project_dip_rebuy_findings
+    memory for the validation. Called only while a position is held and no
+    exit condition fired this tick. Persists the updated running_low even
+    when NOT triggering, so a dip is remembered across ticks until a
+    bounce confirms it (or a fresh, deeper dip resets it lower)."""
+    tranche_count = state["tranche_count"] or 1
+    if tranche_count - 1 >= DIP_REBUY_MAX_ADDS:
+        return  # already at the max extra tranches
+
+    avg_cost = state["entry_price"]
+    running_low = min(state["running_low"] or avg_cost, price)
+    dip_pct = running_low / avg_cost - 1
+    bounce_pct = (price / running_low - 1) if running_low > 0 else 0.0
+    triggered = dip_pct <= DIP_REBUY_THRESHOLD and bounce_pct >= DIP_REBUY_REBOUND
+
+    if not triggered:
+        if running_low != state["running_low"]:
+            save_state(conn, symbol, running_low=running_low)
+        return
+
+    if dry_run:
+        print(f"[{symbol}] DRY RUN would ADD tranche at ~{price} (dip {dip_pct:.2%}, bounce {bounce_pct:.2%})")
+        return
+
+    if mode == "simulate":
+        fill_price = price
+        fill_qty = USDT_PER_TRADE / price
+        order_id = f"SIM-ADD-{int(datetime.now(timezone.utc).timestamp())}"
+    else:
+        order = client.market_buy_quote(symbol, USDT_PER_TRADE)
+        order_id = order.get("orderId")
+        filled = client.wait_for_fill(symbol, order_id)
+        fill_price = float(filled["avgPrice"])
+        fill_qty = float(filled["cumExecQty"])
+
+    old_qty = state["entry_qty"]
+    new_qty = old_qty + fill_qty
+    new_avg_cost = (old_qty * avg_cost + fill_qty * fill_price) / new_qty
+    new_tranche_count = tranche_count + 1
+
+    save_state(conn, symbol, entry_price=new_avg_cost, entry_qty=new_qty,
+               tranche_count=new_tranche_count, running_low=fill_price)
+    record_tranche(conn, symbol, new_tranche_count - 1, fill_price, fill_qty, order_id)
+    log_tick(conn, symbol, None, True, True, "add_tranche",
+             f"tranche {new_tranche_count}, order {order_id} @ {fill_price}, "
+             f"dip {dip_pct:.2%}, bounce {bounce_pct:.2%}, new avg_cost {new_avg_cost}")
+    print(f"[{symbol}] ADDED tranche {new_tranche_count} at {fill_price}, new avg_cost {new_avg_cost}")
+
+    # Same real-balance gate as the sell-alert suppression (2026-09-15) -
+    # "add more" only makes sense if the user actually holds something
+    # real to add to; an unverifiable balance (None) still sends, so a
+    # transient API hiccup never silently hides a real signal.
+    real_balance = get_coin_balance(symbol.replace("USDT", ""))
+    if real_balance is not None and real_balance < NO_REAL_BALANCE_EPS:
+        print(f"[{symbol}] add alert suppressed - no real position to add to ({real_balance})")
+    else:
+        send_alert(_add_alert_text(symbol, fill_price, fill_qty, new_avg_cost, new_tranche_count, mode))
+
+
 def enter_position(conn, client, mode: str, symbol: str, score: float, is_long_target: bool, price: float, dry_run: bool):
     """Executes an entry that has already cleared cooldown/trend-filter/
     capacity checks. Split out from process_symbol() so main() can collect
@@ -240,7 +344,9 @@ def enter_position(conn, client, mode: str, symbol: str, score: float, is_long_t
         fill_qty = float(filled["cumExecQty"])
 
     save_state(conn, symbol, in_position=True, entry_ts=datetime.now(timezone.utc),
-               entry_price=fill_price, entry_qty=fill_qty, entry_order_id=order_id)
+               entry_price=fill_price, entry_qty=fill_qty, entry_order_id=order_id,
+               tranche_count=1, running_low=fill_price)
+    record_tranche(conn, symbol, 0, fill_price, fill_qty, order_id)
     log_tick(conn, symbol, score, is_long_target, True, "enter", f"order {order_id} @ {fill_price}")
     print(f"[{symbol}] ENTERED at {fill_price}, qty {fill_qty}, order {order_id}")
     send_alert(_entry_alert_text(symbol, score, fill_price, fill_qty, mode))
@@ -300,6 +406,7 @@ def process_symbol(conn, client, mode: str, symbol: str, events: pd.DataFrame, d
     exit_reason = "stop_loss" if hit_stop else ("natural" if not is_long_target else None)
 
     if exit_reason is None:
+        maybe_add_tranche(conn, client, mode, symbol, state, price, dry_run)
         log_tick(conn, symbol, score, is_long_target, True, "hold_position")
         print(f"[{symbol}] score={score:.1f} - holding position (entry {entry_price}, now {price})")
         return
@@ -352,7 +459,8 @@ def process_symbol(conn, client, mode: str, symbol: str, events: pd.DataFrame, d
         consecutive_losses = 0
 
     save_state(conn, symbol, in_position=False, entry_ts=None, entry_price=None, entry_qty=None,
-               entry_order_id=None, consecutive_losses=consecutive_losses, cooldown_until_ts=cooldown_until_ts)
+               entry_order_id=None, consecutive_losses=consecutive_losses, cooldown_until_ts=cooldown_until_ts,
+               tranche_count=0, running_low=None)
     log_tick(conn, symbol, score, is_long_target, False, f"exit_{exit_reason}",
              f"order {order_id} @ {exit_price}, net_ret {net_ret:.4f}")
     print(f"[{symbol}] EXITED ({exit_reason}) at {exit_price}, net_ret {net_ret:.2%}, order {order_id}")

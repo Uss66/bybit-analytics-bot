@@ -170,6 +170,10 @@ SELECT create_hypertable('defillama_stablecoins', 'ts', if_not_exists => TRUE);
 -- Testnet paper-trading execution state (2026-08-28) - tracks the live
 -- position state machine per symbol so the hourly-scheduled trader script
 -- (scripts/testnet_trader.py) can resume correctly across separate runs.
+-- entry_price/entry_qty mean "average cost basis / total quantity ACROSS
+-- ALL TRANCHES" (2026-09-18, dip-rebuy add-on - see
+-- project_dip_rebuy_findings memory) once tranche_count > 1, reusing the
+-- existing columns rather than a parallel "avg_cost" field.
 CREATE TABLE IF NOT EXISTS testnet_state (
     symbol             TEXT PRIMARY KEY,
     in_position        BOOLEAN NOT NULL DEFAULT FALSE,
@@ -179,8 +183,23 @@ CREATE TABLE IF NOT EXISTS testnet_state (
     entry_order_id     TEXT,
     consecutive_losses INT NOT NULL DEFAULT 0,
     cooldown_until_ts  TIMESTAMPTZ,
-    updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    tranche_count      INT NOT NULL DEFAULT 0,
+    running_low        DOUBLE PRECISION
 );
+ALTER TABLE testnet_state ADD COLUMN IF NOT EXISTS tranche_count INT NOT NULL DEFAULT 0;
+ALTER TABLE testnet_state ADD COLUMN IF NOT EXISTS running_low DOUBLE PRECISION;
+
+CREATE TABLE IF NOT EXISTS testnet_position_tranches (
+    id            BIGSERIAL PRIMARY KEY,
+    symbol        TEXT NOT NULL,
+    tranche_num   INT NOT NULL,
+    price         DOUBLE PRECISION NOT NULL,
+    qty           DOUBLE PRECISION NOT NULL,
+    order_id      TEXT,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_testnet_position_tranches_symbol ON testnet_position_tranches (symbol, created_at);
 
 CREATE TABLE IF NOT EXISTS testnet_trades (
     id             BIGSERIAL PRIMARY KEY,

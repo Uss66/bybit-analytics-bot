@@ -77,6 +77,13 @@ CREATE TABLE IF NOT EXISTS deribit_dvol (
 -- Live paper-trading state - MUST be seeded from the local DB's current
 -- values (open positions etc.), never created empty, or the bot loses
 -- track of positions already open when the home-PC setup is retired.
+--
+-- entry_price/entry_qty now mean "average cost basis / total quantity
+-- ACROSS ALL TRANCHES" (2026-09-18, dip-rebuy add-on - see
+-- project_dip_rebuy_findings memory) once tranche_count > 1, not just the
+-- original entry - the stop-loss and every other check already computed
+-- off entry_price, so this reuses the existing column semantics rather
+-- than introducing a parallel "avg_cost" field.
 CREATE TABLE IF NOT EXISTS testnet_state (
     symbol             TEXT PRIMARY KEY,
     in_position        BOOLEAN NOT NULL DEFAULT FALSE,
@@ -86,8 +93,30 @@ CREATE TABLE IF NOT EXISTS testnet_state (
     entry_order_id     TEXT,
     consecutive_losses INT NOT NULL DEFAULT 0,
     cooldown_until_ts  TIMESTAMPTZ,
-    updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    tranche_count      INT NOT NULL DEFAULT 0,
+    running_low        DOUBLE PRECISION
 );
+-- Idempotent add for a table that may already exist from before this
+-- feature (ALTER instead of relying on CREATE TABLE, which no-ops once
+-- the table is already there).
+ALTER TABLE testnet_state ADD COLUMN IF NOT EXISTS tranche_count INT NOT NULL DEFAULT 0;
+ALTER TABLE testnet_state ADD COLUMN IF NOT EXISTS running_low DOUBLE PRECISION;
+
+-- One row per tranche (the original entry = tranche_num 0, each dip-rebuy
+-- add increments it) - an audit trail so "why did the average cost
+-- change" is always answerable later, matching this project's existing
+-- practice (see testnet_run_log's own docstring).
+CREATE TABLE IF NOT EXISTS testnet_position_tranches (
+    id            BIGSERIAL PRIMARY KEY,
+    symbol        TEXT NOT NULL,
+    tranche_num   INT NOT NULL,
+    price         DOUBLE PRECISION NOT NULL,
+    qty           DOUBLE PRECISION NOT NULL,
+    order_id      TEXT,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_testnet_position_tranches_symbol ON testnet_position_tranches (symbol, created_at);
 
 CREATE TABLE IF NOT EXISTS testnet_trades (
     id             BIGSERIAL PRIMARY KEY,
@@ -116,3 +145,16 @@ CREATE TABLE IF NOT EXISTS testnet_run_log (
     notes           TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_testnet_run_log_ts ON testnet_run_log (ts DESC);
+
+-- On-demand "куда вложить" Telegram advisor (2026-09-18) - single-row
+-- cursor remembering the last Telegram update_id already handled, so the
+-- polling workflow (scripts/telegram_command_handler.py, every ~30min)
+-- never re-answers an old message. See project_telegram_command_advisor
+-- memory for the full design.
+CREATE TABLE IF NOT EXISTS telegram_command_cursor (
+    id              INT PRIMARY KEY DEFAULT 1,
+    last_update_id  BIGINT NOT NULL DEFAULT 0,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO telegram_command_cursor (id, last_update_id)
+VALUES (1, 0) ON CONFLICT (id) DO NOTHING;

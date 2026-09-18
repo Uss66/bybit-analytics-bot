@@ -1,0 +1,256 @@
+"""
+On-demand "куда вложить свободные деньги" advisor (2026-09-18), triggered
+by a Telegram message instead of the hourly push alerts. User asked for a
+PULL-based query on top of the existing PUSH-based entry/exit alerts (see
+project_telegram_alerts memory) - "when I have spare money, let me ask the
+bot which coin to put it in, and whether it's even worth investing in
+crypto right now."
+
+Reuses strategy.py's exact live scoring (generate_signals +
+compute_score_series) - same function testnet_trader.py calls every hour -
+so the answer is never a separate, driftable reimplementation of the real
+signal.
+
+Deliberately reports the STRATEGY'S signal state, never personal
+financial advice ("вложить" framed as "what the validated rules say right
+now", not "you should buy"). Per user's explicit choice (2026-09-18): the
+portfolio-wide MAX_POSITIONS cap is honored here too - if the cap is
+already full, that's reported plainly (no new entry recommended by the
+same risk-managed logic), even if some symbol's own score looks strong.
+
+IMPORTANT DISTINCTION found 2026-09-18 (user was confused why the advisor
+said the cap was full when they only actually hold BTC): the cap check
+here counts REAL Bybit positions (get_coin_balance per symbol > dust),
+NOT `testnet_state`'s paper/simulated positions. The paper state tracks
+what the fully-followed validated strategy WOULD be doing (used by the
+hourly push alerts - see project_telegram_alerts) - it's a different
+question from "given what I actually hold, where should NEW spare real
+money go", which is what THIS on-demand feature answers. The two can
+disagree (paper had 4 "open", real was BTC-only) and that's expected,
+not a bug - they're deliberately answering different questions.
+
+Runs on a ~30min GitHub Actions cron (.github/workflows/telegram_commands.yml)
+- NOT the hourly tick's own workflow, so query latency is independent of
+the hourly data-refresh schedule. Tracks a single-row cursor
+(telegram_command_cursor) so the same message is never answered twice.
+
+Usage:
+    python scripts/telegram_command_handler.py
+"""
+import os
+
+import pandas as pd
+import requests
+
+from db import get_connection
+from strategy import load_events_with_returns, generate_signals, compute_score_series
+from telegram_notify import send_alert, BOT_TOKEN, CHAT_ID
+from testnet_trader import MAX_POSITIONS, TREND_FILTER_SMA, NO_REAL_BALANCE_EPS
+from bybit_balance import get_coin_balance
+
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "BNBUSDT", "LINKUSDT"]
+
+# Recognized triggers - a formal bot command plus the natural-language
+# phrasing the user actually used when asking for this feature. Keep this
+# list short and specific rather than matching on loose keywords like
+# "крипта" alone, so casual chat in the group never accidentally fires it.
+TRIGGERS = ["/invest", "куда вложить", "стоит ли вкладывать", "стоит ли инвестировать"]
+
+
+def get_cursor(conn) -> int:
+    with conn.cursor() as cur:
+        cur.execute("SELECT last_update_id FROM telegram_command_cursor WHERE id = 1")
+        row = cur.fetchone()
+        return row[0] if row else 0
+
+
+def set_cursor(conn, update_id: int):
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE telegram_command_cursor SET last_update_id = %s, updated_at = now() WHERE id = 1",
+            (update_id,),
+        )
+    conn.commit()
+
+
+def fetch_updates(offset: int) -> list[dict]:
+    if not BOT_TOKEN:
+        print("[telegram_command_handler] TELEGRAM_BOT_TOKEN not set, nothing to poll")
+        return []
+    resp = requests.get(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
+        params={"offset": offset, "timeout": 0},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get("ok"):
+        print(f"[telegram_command_handler] getUpdates failed: {data}")
+        return []
+    return data["result"]
+
+
+def compute_signal_snapshot(conn) -> pd.DataFrame:
+    """One row per symbol: current score/price/trend-filter status, using
+    the exact same scoring + entry-eligibility path as testnet_trader.py's
+    live tick (score>0 AND price above its trailing SMA720) - never a
+    separate reimplementation. A symbol can have score>0 and still be
+    `trend_ok=False` (price below its own 30d trend) - testnet_trader.py
+    would log that as skip_trend_filter and never actually enter, so the
+    advisor must reflect the SAME two-part condition, not score alone."""
+    events = load_events_with_returns(conn)
+    rows = []
+    for symbol in SYMBOLS:
+        ohlcv = pd.read_sql(
+            "SELECT ts, close FROM ohlcv WHERE symbol = %(s)s ORDER BY ts", conn, params={"s": symbol}
+        )
+        ohlcv["ts"] = pd.to_datetime(ohlcv["ts"], utc=True)
+        if len(ohlcv) < TREND_FILTER_SMA // 3:
+            continue
+        signals = generate_signals(events, symbol)
+        ohlcv["score"] = compute_score_series(signals, ohlcv)
+        ohlcv["sma"] = ohlcv["close"].rolling(TREND_FILTER_SMA, min_periods=TREND_FILTER_SMA // 3).mean()
+        latest = ohlcv.iloc[-1]
+        sma = latest["sma"]
+        trend_ok = not (pd.notna(sma) and latest["close"] < sma)
+        rows.append(dict(symbol=symbol, score=float(latest["score"]), price=float(latest["close"]),
+                          trend_ok=trend_ok))
+    return pd.DataFrame(rows)
+
+
+def count_real_positions() -> tuple[int, bool]:
+    """How many of the 7 symbols the user REALLY holds right now (Unified
+    + Funding, dust-thresholded) - NOT testnet_state's paper positions,
+    see module docstring for why that distinction matters here. Second
+    return value is False if any lookup failed (creds missing / API
+    hiccup), meaning the count is a floor, not necessarily exact -
+    callers should say so rather than presenting it as certain."""
+    count = 0
+    reliable = True
+    for symbol in SYMBOLS:
+        bal = get_coin_balance(symbol.replace("USDT", ""))
+        if bal is None:
+            reliable = False
+            continue
+        if bal >= NO_REAL_BALANCE_EPS:
+            count += 1
+    return count, reliable
+
+
+def build_reply(conn) -> str:
+    open_count, balance_reliable = count_real_positions()
+    snapshot = compute_signal_snapshot(conn)
+    # entry-eligible = score>0 AND above its own trend filter, matching
+    # testnet_trader.py's actual entry condition exactly (a positive score
+    # alone isn't enough live - see compute_signal_snapshot's docstring)
+    active = snapshot[(snapshot["score"] > 0) & snapshot["trend_ok"]].sort_values("score", ascending=False)
+    blocked_by_trend = snapshot[(snapshot["score"] > 0) & ~snapshot["trend_ok"]]
+
+    # One-line bottom-line verdict FIRST (2026-09-18, per user feedback -
+    # the detail-first version made them re-derive the answer themselves
+    # from the signal list + cap warning instead of just reading it).
+    # Same three-way logic as the detail below, just stated up front.
+    if open_count >= MAX_POSITIONS:
+        verdict = (
+            f"\U0001F534 ВЕРДИКТ: сейчас НЕ СТОИТ открывать новую позицию ни в одной монете — "
+            f"у вас уже реально открыто {open_count} из {MAX_POSITIONS} допустимых по риск-профилю стратегии."
+        )
+    elif active.empty:
+        verdict = "\U0001F7E1 ВЕРДИКТ: сейчас нет доступного сигнала входа ни по одной из 7 монет — вкладывать некуда."
+    else:
+        top = active.iloc[0]
+        verdict = (
+            f"\U0001F7E2 ВЕРДИКТ: сейчас лучше всего подходит {top.symbol} "
+            f"(score={top.score:.1f}, цена {top.price:,.6g} USDT)."
+        )
+
+    lines = ["\U0001F4CA ОТВЕТ НА ЗАПРОС\n", verdict, ""]
+
+    lines.append("Подробности:")
+    if active.empty:
+        lines.append(
+            "Сейчас НИ ПО ОДНОЙ из 7 монет нет реально доступного сигнала на вход "
+            "(score ≤ 0, либо цена ниже своего трендового фильтра). По собственной "
+            "логике стратегии сейчас не время открывать новую позицию ни в одной из "
+            "отслеживаемых монет."
+        )
+    else:
+        lines.append("Активный и доступный сигнал на вход (score > 0, выше трендового фильтра), по убыванию силы:")
+        for r in active.itertuples():
+            lines.append(f"  • {r.symbol}: score={r.score:.1f}, цена {r.price:,.6g} USDT")
+
+    if not blocked_by_trend.empty:
+        names = ", ".join(blocked_by_trend["symbol"])
+        lines.append(
+            f"\n(Есть сигнал, но заблокирован трендовым фильтром — цена ниже SMA720: {names}. "
+            f"Стратегия не входит в подтверждённый нисходящий тренд даже при положительном score.)"
+        )
+
+    lines.append(f"\nРеально открыто (по вашему балансу на Bybit): {open_count} из {MAX_POSITIONS} допустимых.")
+    if not balance_reliable:
+        lines.append(
+            "⚠️ Не удалось проверить баланс по части монет (ключ/API недоступны) — "
+            "число открытых позиций ниже может быть занижено."
+        )
+
+    if open_count >= MAX_POSITIONS:
+        lines.append(
+            "⚠️ Лимит одновременных позиций уже заполнен (или превышен) по вашим реальным остаткам. "
+            "По валидированному риск-профилю (кэп=3 — лучшее соотношение доходность/просадка "
+            "и на train, и на holdout) новую позицию открывать сейчас не стоит, даже если у "
+            "какой-то монеты сильный score — свободных мест нет."
+        )
+    elif not active.empty:
+        free_slots = MAX_POSITIONS - open_count
+        top = active.iloc[0]
+        lines.append(
+            f"Свободных мест: {free_slots}. Если ориентироваться на текущую силу сигнала "
+            f"(так же, как это делает сам бот при конкуренции за место), впереди {top.symbol} "
+            f"(score={top.score:.1f})."
+        )
+
+    lines.append(
+        "\nℹ️ Это срез текущего состояния валидированной стратегии, а не "
+        "персональная инвестиционная рекомендация — решение и реальная сделка (если делаете) "
+        "всегда за вами."
+    )
+    return "\n".join(lines)
+
+
+def main():
+    conn = get_connection()
+    offset = get_cursor(conn)
+    updates = fetch_updates(offset + 1)
+    if not updates:
+        print("[telegram_command_handler] no new updates")
+        conn.close()
+        return
+
+    max_update_id = offset
+    triggered = False
+    for update in updates:
+        max_update_id = max(max_update_id, update["update_id"])
+        message = update.get("message") or update.get("channel_post")
+        if not message:
+            continue
+        if str(message.get("chat", {}).get("id")) != str(CHAT_ID):
+            continue
+        if message.get("from", {}).get("is_bot"):
+            continue
+        text = (message.get("text") or "").strip().lower()
+        if any(trigger in text for trigger in TRIGGERS):
+            triggered = True
+
+    if triggered:
+        reply = build_reply(conn)
+        send_alert(reply)
+        print("[telegram_command_handler] replied to an /invest-style query")
+    else:
+        print(f"[telegram_command_handler] {len(updates)} update(s) checked, no trigger matched")
+
+    set_cursor(conn, max_update_id)
+    conn.close()
+
+
+if __name__ == "__main__":
+    main()
