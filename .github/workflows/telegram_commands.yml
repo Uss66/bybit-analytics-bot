@@ -5,16 +5,21 @@ name: Telegram on-demand advisor
 # memory / README for the full design. Separate from hourly.yml (the
 # trading tick) so query latency doesn't depend on the hourly schedule.
 #
-# Minutes budget (private repo, 2000 free/month): hourly.yml alone runs
-# ~950-1000 min/month (measured ~1m20-30s/run x 720 runs). This job at a
-# 30min interval (48 runs/day, ~1440/month) needs to stay well under
-# ~30s/run average to leave headroom - pip caching should make repeat
-# installs fast, but if minutes run tight, widen the cron interval before
-# anything else (this job is the discretionary one; never let it starve
-# the hourly trading tick's budget).
+# Minutes budget (private repo, 2000 free/month) - KNOWINGLY TIGHT
+# (2026-09-18, user chose speed over margin after being shown the math):
+# hourly.yml alone runs ~950-1000 min/month. This job's real measured
+# duration is ~22-40s/run (checkout+setup+pip install dominate - the
+# Python logic itself is fast, see telegram_command_handler.py's early
+# "no new updates" exit). At 15min (96 runs/day, ~2880/month) that's
+# ~1000-1900 min/month just for this job depending on actual per-run
+# time - combined with hourly.yml this can exceed the 2000 free minutes
+# some months. If GitHub starts throttling/disabling Actions for the
+# month, this discretionary job must be the one that gets widened back
+# (e.g. to 30min) FIRST, never let it starve the hourly trading tick.
+# Watch Settings -> Billing -> Actions usage if in doubt.
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "*/15 * * * *"
   workflow_dispatch: {}
 
 jobs:
