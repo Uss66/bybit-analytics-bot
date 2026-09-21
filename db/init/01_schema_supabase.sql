@@ -219,11 +219,16 @@ BEGIN
     ) INTO v_request_id;
 
     -- pg_net is async by design (doesn't block the caller's transaction) -
-    -- poll for up to ~6s, Bybit responds in well under 1s normally.
+    -- poll for up to ~30s - a first attempt at ~6s timed out every time
+    -- (2026-09-21), even though the same net.http_get() pattern called as
+    -- a plain top-level SELECT (not from inside a function) resolved
+    -- within ~4s in earlier ad-hoc testing - the pg_net background worker
+    -- may need longer once wrapped in a PL/pgSQL polling loop. Bybit
+    -- itself responds in well under 1s once the request actually lands.
     LOOP
         SELECT status_code, content INTO v_status, v_body FROM net._http_response WHERE id = v_request_id;
-        EXIT WHEN v_status IS NOT NULL OR v_tries > 30;
-        PERFORM pg_sleep(0.2);
+        EXIT WHEN v_status IS NOT NULL OR v_tries > 60;
+        PERFORM pg_sleep(0.5);
         v_tries := v_tries + 1;
     END LOOP;
 
