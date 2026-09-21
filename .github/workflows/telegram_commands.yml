@@ -55,5 +55,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           BYBIT_API_KEY: ${{ secrets.BYBIT_API_KEY }}
           BYBIT_API_SECRET: ${{ secrets.BYBIT_API_SECRET }}
+          BYBIT_PROXY_URL: ${{ secrets.BYBIT_PROXY_URL }}
+          BYBIT_PROXY_SECRET: ${{ secrets.BYBIT_PROXY_SECRET }}
           TELEGRAM_UPDATE_JSON: ${{ github.event.inputs.update_json }}
         run: python telegram_command_handler.py

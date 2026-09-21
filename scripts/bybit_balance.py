@@ -23,9 +23,12 @@ on your real account):
      "Trade" or "Withdraw" for this key - there is no reason this key ever
      needs those, and leaving them off means even a leaked key can't move
      your funds.
-  4. Set BYBIT_API_KEY / BYBIT_API_SECRET in .env (project root) - a
-     DIFFERENT pair of env vars from BYBIT_TESTNET_API_KEY/SECRET used by
-     bybit_client.py, so the two are never accidentally cross-wired.
+  4. The key/secret now live as Supabase Edge Function secrets
+     (BYBIT_API_KEY/BYBIT_API_SECRET on the `bybit-proxy` function), NOT
+     in this process's own .env - see the 2026-09-21 note below for why.
+     This process instead needs BYBIT_PROXY_URL (the function's invoke
+     URL) and BYBIT_PROXY_SECRET (a shared secret checked by the proxy)
+     in its own .env / GitHub Secrets.
 
 If these env vars are missing, get_usdt_balance() returns None (not an
 error) so the alerting code can gracefully omit the balance line rather
@@ -35,10 +38,7 @@ Usage:
     from bybit_balance import get_usdt_balance
     bal = get_usdt_balance()  # float or None
 """
-import hashlib
-import hmac
 import os
-import time
 from pathlib import Path
 
 import requests
@@ -46,50 +46,46 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-BASE_URL = "https://api.bybit.com"  # real mainnet - READ ENDPOINTS ONLY are ever called from this file
-RECV_WINDOW = "20000"
-
-API_KEY = os.environ.get("BYBIT_API_KEY")
-API_SECRET = os.environ.get("BYBIT_API_SECRET")
+# 2026-09-21: calls no longer go straight to Bybit from here - GitHub
+# Actions runners got a confirmed 403 from Bybit's CloudFront ("configured
+# to block access from your country"), a geo-block that has nothing to do
+# with credentials/signature and can't be fixed by an IP whitelist (GH
+# Actions runner IPs aren't stable anyway). Supabase's own infra (AWS
+# eu-west-1) was confirmed NOT blocked, so the actual signed Bybit call now
+# happens in a Supabase Edge Function (supabase/functions/bybit-proxy) -
+# this module just forwards path+params to it and unwraps the response.
+# The real Bybit API key/secret now live ONLY as Supabase Edge Function
+# secrets, not in this process's environment - see
+# project_bybit_geoblock_proxy memory for the full story.
+PROXY_URL = os.environ.get("BYBIT_PROXY_URL")
+PROXY_SECRET = os.environ.get("BYBIT_PROXY_SECRET")
 _warned_missing_creds = False
 
 
 def _warn_missing_creds():
-    """One-time diagnostic print when BYBIT_API_KEY/SECRET aren't set -
-    added 2026-09-18 after telegram_commands.yml shipped without these two
-    secrets in its env block (copy-paste gap from hourly.yml) and every
-    balance check silently returned None with ZERO trace in the GitHub
-    Actions log, making the resulting 'не удалось проверить баланс'
-    advisor message look like a Bybit API problem instead of a missing-
-    secret one. Silent None is still the right return value (callers must
-    treat it as 'unknown', not '0'), but silent should not mean invisible
-    in the log too."""
+    """One-time diagnostic print when the proxy isn't configured - mirrors
+    the 2026-09-18 finding that a silent None with zero log trace makes a
+    missing-secret problem look like a Bybit API problem. Silent None is
+    still the right return value (callers must treat it as 'unknown', not
+    '0'), but silent should not mean invisible in the log too."""
     global _warned_missing_creds
     if not _warned_missing_creds:
-        print("[bybit_balance] BYBIT_API_KEY/BYBIT_API_SECRET not set - balance checks disabled "
-              "(if this is a GitHub Actions run, check the workflow's env: block has both secrets)")
+        print("[bybit_balance] BYBIT_PROXY_URL/BYBIT_PROXY_SECRET not set - balance checks disabled "
+              "(check the workflow's env: block, or .env locally)")
         _warned_missing_creds = True
 
 
-def _sign(payload: str, timestamp: str) -> str:
-    raw = f"{timestamp}{API_KEY}{RECV_WINDOW}{payload}"
-    return hmac.new(API_SECRET.encode(), raw.encode(), hashlib.sha256).hexdigest()
-
-
 def _get(path: str, params: dict) -> dict:
-    query = "&".join(f"{k}={v}" for k, v in sorted(params.items()) if v is not None)
-    timestamp = str(int(time.time() * 1000))
-    headers = {
-        "X-BAPI-API-KEY": API_KEY,
-        "X-BAPI-TIMESTAMP": timestamp,
-        "X-BAPI-RECV-WINDOW": RECV_WINDOW,
-        "X-BAPI-SIGN": _sign(query, timestamp),
-    }
-    resp = requests.get(f"{BASE_URL}{path}", params=params, headers=headers, timeout=20)
+    resp = requests.post(
+        PROXY_URL,
+        json={"path": path, "params": params},
+        headers={"X-Proxy-Secret": PROXY_SECRET},
+        timeout=20,
+    )
     resp.raise_for_status()
     data = resp.json()
     if data.get("retCode") != 0:
-        raise RuntimeError(f"Bybit API error on GET {path}: {data}")
+        raise RuntimeError(f"Bybit API error on GET {path} (via proxy): {data}")
     return data["result"]
 
 
@@ -103,7 +99,7 @@ def get_usdt_balance() -> float | None:
     0, which looked like a bug until checked directly). Returns None if
     BYBIT_API_KEY/SECRET aren't configured or the call fails - callers
     must treat None as 'unknown, don't show a figure', never as 0."""
-    if not API_KEY or not API_SECRET:
+    if not PROXY_URL or not PROXY_SECRET:
         _warn_missing_creds()
         return None
     try:
@@ -129,7 +125,7 @@ def get_full_balance() -> dict | None:
     number, is the point - a user with funds parked in Funding but
     reading only a Unified balance of 0 would wrongly conclude they have
     nothing, exactly what happened here before this was added."""
-    if not API_KEY or not API_SECRET:
+    if not PROXY_URL or not PROXY_SECRET:
         _warn_missing_creds()
         return None
     try:
@@ -165,7 +161,7 @@ def get_coin_balance(coin: str) -> float | None:
     fails - callers must treat None as 'unknown, don't suppress the
     alert', never as 'confirmed zero', so a transient API hiccup never
     silently hides a real actionable signal."""
-    if not API_KEY or not API_SECRET:
+    if not PROXY_URL or not PROXY_SECRET:
         _warn_missing_creds()
         return None
     try:
@@ -190,7 +186,7 @@ def get_coin_balance(coin: str) -> float | None:
 if __name__ == "__main__":
     full = get_full_balance()
     if full is None:
-        print("BYBIT_API_KEY/BYBIT_API_SECRET not set, or fetch failed")
+        print("BYBIT_PROXY_URL/BYBIT_PROXY_SECRET not set, or fetch failed")
     else:
         print(f"Unified (tradeable): {full['unified_usdt']} USDT")
         print(f"Funding (needs transfer to trade): {full['funding_usdt']} USDT, {full['funding_btc']} BTC")
