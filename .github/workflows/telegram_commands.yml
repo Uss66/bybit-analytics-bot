@@ -1,26 +1,33 @@
 name: Telegram on-demand advisor
 
-# Polls for a "/invest"-style Telegram message and replies with the
-# strategy's current signal snapshot - see project_telegram_command_advisor
-# memory / README for the full design. Separate from hourly.yml (the
-# trading tick) so query latency doesn't depend on the hourly schedule.
+# Replies to a "/invest"-style Telegram message with the strategy's current
+# signal snapshot - see project_telegram_advisor_webhook memory / README for
+# the full design. Separate from hourly.yml (the trading tick) so query
+# latency doesn't depend on the hourly schedule.
 #
-# Minutes budget (private repo, 2000 free/month) - KNOWINGLY TIGHT
-# (2026-09-18, user chose speed over margin after being shown the math):
-# hourly.yml alone runs ~950-1000 min/month. This job's real measured
-# duration is ~22-40s/run (checkout+setup+pip install dominate - the
-# Python logic itself is fast, see telegram_command_handler.py's early
-# "no new updates" exit). At 15min (96 runs/day, ~2880/month) that's
-# ~1000-1900 min/month just for this job depending on actual per-run
-# time - combined with hourly.yml this can exceed the 2000 free minutes
-# some months. If GitHub starts throttling/disabling Actions for the
-# month, this discretionary job must be the one that gets widened back
-# (e.g. to 30min) FIRST, never let it starve the hourly trading tick.
-# Watch Settings -> Billing -> Actions usage if in doubt.
+# 2026-09-21: switched from a `schedule:` cron poll to a Telegram webhook.
+# GitHub's `schedule:` trigger turned out to be unreliable by a large,
+# inconsistent margin (confirmed via GitHub Actions run timestamps: an
+# hourly cron was actually firing every 3-6h, and this job's 15min cron
+# went completely silent for ~23h at one point) - not fixable by tuning the
+# interval, it's a platform-level deprioritization of `schedule:` events.
+# Fix: a Supabase Edge Function (supabase/functions/telegram-webhook)
+# receives Telegram's webhook call the instant a message arrives, does a
+# fast trigger-phrase pre-filter, and fires THIS workflow via
+# `workflow_dispatch` (which GitHub does not delay/drop the way it does
+# `schedule:` - confirmed near-instant in testing), passing the single
+# Telegram update as the `update_json` input. This also means the bot no
+# longer polls getUpdates() at all (registering a webhook with Telegram
+# disables getUpdates for the bot - 409 Conflict if called), so there is no
+# `schedule:` fallback anymore - Telegram's own webhook delivery (which
+# retries on failure) is the reliability mechanism now, not GitHub's cron.
 on:
-  schedule:
-    - cron: "*/15 * * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      update_json:
+        description: "Telegram update JSON (passed by the webhook Edge Function)"
+        required: false
+        default: ""
 
 jobs:
   check:
@@ -48,4 +55,5 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           BYBIT_API_KEY: ${{ secrets.BYBIT_API_KEY }}
           BYBIT_API_SECRET: ${{ secrets.BYBIT_API_SECRET }}
+          TELEGRAM_UPDATE_JSON: ${{ github.event.inputs.update_json }}
         run: python telegram_command_handler.py

@@ -29,22 +29,32 @@ money go", which is what THIS on-demand feature answers. The two can
 disagree (paper had 4 "open", real was BTC-only) and that's expected,
 not a bug - they're deliberately answering different questions.
 
-Runs on a ~30min GitHub Actions cron (.github/workflows/telegram_commands.yml)
-- NOT the hourly tick's own workflow, so query latency is independent of
-the hourly data-refresh schedule. Tracks a single-row cursor
-(telegram_command_cursor) so the same message is never answered twice.
+Triggered by a Telegram webhook (2026-09-21, replaces the original ~30min
+GitHub Actions cron poll - see project_telegram_advisor_webhook memory /
+README). GitHub's `schedule:` trigger turned out to be unreliable by a
+large, inconsistent margin (confirmed: an hourly cron actually firing every
+3-6h) - not fixable by tuning the interval. Fix: a Supabase Edge Function
+(supabase/functions/telegram-webhook) receives Telegram's webhook call the
+instant a message arrives, does a fast trigger-phrase pre-filter, and fires
+this workflow via `workflow_dispatch` (which GitHub does NOT delay/drop the
+way it does `schedule:`), passing the single Telegram update as the
+`update_json` input. This script now processes exactly that one update -
+no more getUpdates()/cursor polling, because registering a webhook with
+Telegram disables getUpdates for the bot entirely (409 Conflict if called).
 
 Usage:
     python scripts/telegram_command_handler.py
+    (expects TELEGRAM_UPDATE_JSON in the environment - set by
+    telegram_commands.yml from the workflow_dispatch input)
 """
+import json
 import os
 
 import pandas as pd
-import requests
 
 from db import get_connection
 from strategy import load_events_with_returns, generate_signals, compute_score_series
-from telegram_notify import send_alert, BOT_TOKEN, CHAT_ID
+from telegram_notify import send_alert, CHAT_ID
 from testnet_trader import MAX_POSITIONS, TREND_FILTER_SMA, NO_REAL_BALANCE_EPS
 from bybit_balance import get_coin_balance
 
@@ -55,39 +65,6 @@ SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "BNBUSDT", "L
 # list short and specific rather than matching on loose keywords like
 # "крипта" alone, so casual chat in the group never accidentally fires it.
 TRIGGERS = ["/invest", "куда вложить", "стоит ли вкладывать", "стоит ли инвестировать"]
-
-
-def get_cursor(conn) -> int:
-    with conn.cursor() as cur:
-        cur.execute("SELECT last_update_id FROM telegram_command_cursor WHERE id = 1")
-        row = cur.fetchone()
-        return row[0] if row else 0
-
-
-def set_cursor(conn, update_id: int):
-    with conn.cursor() as cur:
-        cur.execute(
-            "UPDATE telegram_command_cursor SET last_update_id = %s, updated_at = now() WHERE id = 1",
-            (update_id,),
-        )
-    conn.commit()
-
-
-def fetch_updates(offset: int) -> list[dict]:
-    if not BOT_TOKEN:
-        print("[telegram_command_handler] TELEGRAM_BOT_TOKEN not set, nothing to poll")
-        return []
-    resp = requests.get(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
-        params={"offset": offset, "timeout": 0},
-        timeout=15,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    if not data.get("ok"):
-        print(f"[telegram_command_handler] getUpdates failed: {data}")
-        return []
-    return data["result"]
 
 
 def compute_signal_snapshot(conn) -> pd.DataFrame:
@@ -218,38 +195,33 @@ def build_reply(conn) -> str:
 
 
 def main():
-    conn = get_connection()
-    offset = get_cursor(conn)
-    updates = fetch_updates(offset + 1)
-    if not updates:
-        print("[telegram_command_handler] no new updates")
-        conn.close()
+    raw = os.environ.get("TELEGRAM_UPDATE_JSON", "").strip()
+    if not raw:
+        print("[telegram_command_handler] no update_json input, nothing to do")
         return
 
-    max_update_id = offset
-    triggered = False
-    for update in updates:
-        max_update_id = max(max_update_id, update["update_id"])
-        message = update.get("message") or update.get("channel_post")
-        if not message:
-            continue
-        if str(message.get("chat", {}).get("id")) != str(CHAT_ID):
-            continue
-        if message.get("from", {}).get("is_bot"):
-            continue
-        text = (message.get("text") or "").strip().lower()
-        if any(trigger in text for trigger in TRIGGERS):
-            triggered = True
+    update = json.loads(raw)
+    message = update.get("message") or update.get("channel_post")
+    if not message:
+        print("[telegram_command_handler] update has no message, ignoring")
+        return
+    if str(message.get("chat", {}).get("id")) != str(CHAT_ID):
+        print("[telegram_command_handler] update from a different chat, ignoring")
+        return
+    if message.get("from", {}).get("is_bot"):
+        print("[telegram_command_handler] update from a bot, ignoring")
+        return
 
-    if triggered:
-        reply = build_reply(conn)
-        send_alert(reply)
-        print("[telegram_command_handler] replied to an /invest-style query")
-    else:
-        print(f"[telegram_command_handler] {len(updates)} update(s) checked, no trigger matched")
+    text = (message.get("text") or "").strip().lower()
+    if not any(trigger in text for trigger in TRIGGERS):
+        print("[telegram_command_handler] update did not match any trigger")
+        return
 
-    set_cursor(conn, max_update_id)
+    conn = get_connection()
+    reply = build_reply(conn)
     conn.close()
+    send_alert(reply)
+    print("[telegram_command_handler] replied to an /invest-style query")
 
 
 if __name__ == "__main__":
