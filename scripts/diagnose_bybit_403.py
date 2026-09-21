@@ -22,6 +22,7 @@ import requests
 from dotenv import load_dotenv
 
 from telegram_notify import send_alert
+import bybit_balance
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
@@ -64,6 +65,9 @@ def main():
         f"cf-ray: {resp.headers.get('cf-ray')}\n"
         f"body: {body}"
     )
+    proxy_btc = bybit_balance.get_coin_balance("BTC")
+    msg += f"\n\nvia bybit-proxy: get_coin_balance('BTC') = {proxy_btc}"
+
     print(msg)
     send_alert(msg)
 
