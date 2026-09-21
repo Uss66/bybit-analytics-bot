@@ -66,10 +66,10 @@ def main():
         f"body: {body}"
     )
     try:
-        pg_net_btc = bybit_balance.get_coin_balance("BTC")
-        msg += f"\n\nvia pg_net (bybit_wallet_balance()): get_coin_balance('BTC') = {pg_net_btc}"
+        pg_net_result = bybit_balance._get("/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": "BTC"})
+        msg += f"\n\nvia pg_net (_get, raw): {pg_net_result}"
     except Exception as e:
-        msg += f"\n\nvia pg_net (bybit_wallet_balance()): raised {e}"
+        msg += f"\n\nvia pg_net (_get, raw): raised {type(e).__name__}: {e}"
 
     print(msg)
     send_alert(msg)
