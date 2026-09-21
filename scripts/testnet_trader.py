@@ -1,8 +1,8 @@
 """
-Hourly-scheduled paper-trading executor. Reuses strategy.py's exact
-scoring logic (generate_signals + compute_score_series) so the live
-decision rule is identical to what was backtested - no separate "live"
-reimplementation to drift out of sync.
+Scheduled paper-trading executor (one tick every 15 minutes). Reuses
+strategy.py's exact scoring logic (generate_signals + compute_score_series)
+so the live decision rule is identical to what was backtested - no separate
+"live" reimplementation to drift out of sync.
 
 Two execution modes (--mode):
   "simulate" (default) - fills are simulated at the current public OHLCV
@@ -20,8 +20,8 @@ Two execution modes (--mode):
     bybit_client.py. Kept for if/when Bybit account access is resolved.
 
 State machine per symbol, mirroring strategy.py's backtest() exactly but
-online (one hourly tick at a time, state persisted in `testnet_state`
-between runs) instead of vectorized over a whole historical timeline:
+online (one tick at a time, state persisted in `testnet_state` between
+runs) instead of vectorized over a whole historical timeline:
 
   not in position:
     - skip if still in a cooldown window (after N consecutive losses)
@@ -35,7 +35,7 @@ between runs) instead of vectorized over a whole historical timeline:
 
 Portfolio-wide exposure cap (added 2026-09-13, MAX_POSITIONS=3 by default):
 since fgi_greed/DVOL are market-wide signals, several symbols often want to
-enter in the very same hourly tick (the first live run opened 6 of 7 at
+enter in the very same tick (the first live run opened 6 of 7 at
 once). Exits/holds/skips run immediately per symbol; entry candidates are
 collected across ALL symbols first, then arbitrated as one batch - if more
 symbols want in than there's room for, the highest score wins the
@@ -53,7 +53,7 @@ blindly): if `wait_for_fill` times out waiting for an order to reach
 Filled (order placed but exchange lag or a network hiccup on our side
 means we never see the confirmation), the exception aborts BEFORE
 `save_state`/`record_trade` run, so our local state won't reflect an order
-that may have actually filled on the exchange. The next hourly tick would
+that may have actually filled on the exchange. The next tick would
 then see the old state (e.g. still "flat") and could act on stale
 information (e.g. try to buy again, doubling the position). Order IDs are
 always printed/logged on the error path specifically so this is
@@ -62,7 +62,8 @@ there if a tick logs an "error" action. Not built out further because this
 is testnet money and the first goal is observing real behavior, not
 building a fully self-healing executor before we've seen it run once.
 
-Usage (intended to be run hourly via Task Scheduler):
+Usage (runs every 15 minutes in CI - a Supabase pg_cron job dispatches
+.github/workflows/hourly.yml; the filename is historical):
     python scripts/testnet_trader.py --symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,BNBUSDT,LINKUSDT
 """
 import argparse
@@ -88,6 +89,19 @@ COOLDOWN_AFTER_LOSSES = 3
 COOLDOWN_HOURS = 168
 USDT_PER_TRADE = 100.0  # fixed paper-money position size per entry
 
+# 2026-09-22: refuse to act on a stale price feed. Found the hard way -
+# fetch_bybit_ohlcv.py had been failing on EVERY GitHub Actions run since
+# the Supabase migration (Bybit geo-blocks the runners, see
+# bybit_public.py), so from 2026-09-15 to 2026-09-21 the bot evaluated its
+# -8% stop-loss and its trend filter against a six-day-old close while the
+# run log looked perfectly healthy. A stop-loss measured against a stale
+# price is not a stop-loss. The newest hourly candle is the IN-PROGRESS
+# one, so its ts is the start of the current hour: up to ~60min of age is
+# normal, and this threshold allows one fully missed refresh on top of
+# that before the bot stops trading and says so out loud.
+MAX_PRICE_AGE_MINUTES = 120
+STALE_ALERT_COOLDOWN_HOURS = 6  # don't re-send the same alarm every 15min tick
+
 # Dip-rebuy add-on (2026-09-18) - VALIDATED, see project_dip_rebuy_findings
 # memory: while a position is held, add a tranche when price has dropped
 # DIP_REBUY_THRESHOLD below the position's average cost AND has since
@@ -105,7 +119,7 @@ DIP_REBUY_MAX_ADDS = 2
 MAX_POSITIONS = 3  # portfolio-wide cap on simultaneous open positions, added 2026-09-13 -
 # validated via strategy.py's simulate_portfolio() on the full extended history: best
 # risk-adjusted (return/drawdown) ratio of any cap on BOTH train (4.94x) and holdout
-# (6.25x), see README.md "Портфельный лимит экспозиции". Ties at the same hourly tick
+# (6.25x), see README.md "Портфельный лимит экспозиции". Ties at the same tick
 # (routine here - fgi_greed/DVOL are market-wide) are broken by highest score first.
 
 
@@ -479,6 +493,43 @@ def process_symbol(conn, client, mode: str, symbol: str, events: pd.DataFrame, d
         send_alert(_exit_alert_text(symbol, exit_price, exit_reason, net_ret, mode))
 
 
+def price_feed_age(conn, symbols: list[str]):
+    """Age of the freshest candle we have for these symbols, as (minutes,
+    latest_ts) - or (None, None) if there is no data at all."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT max(ts) FROM ohlcv WHERE symbol = ANY(%s)", (symbols,))
+        latest = cur.fetchone()[0]
+    if latest is None:
+        return None, None
+    return (datetime.now(timezone.utc) - latest).total_seconds() / 60.0, latest
+
+
+def stale_alert_recently_sent(conn) -> bool:
+    """True if we already alerted about a stale feed within the cooldown -
+    the tick runs every 15 minutes, and an outage that lasts days should
+    not produce hundreds of identical Telegram messages."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM testnet_run_log WHERE action_taken = 'skip_stale_price' "
+            "AND ts > now() - %s::interval LIMIT 1",
+            (f"{STALE_ALERT_COOLDOWN_HOURS} hours",),
+        )
+        return cur.fetchone() is not None
+
+
+def _stale_alert_text(age_minutes: float, latest_ts) -> str:
+    return (
+        "\U000026A0 ДАННЫЕ УСТАРЕЛИ — бот приостановлен\n\n"
+        f"Последняя свеча: {latest_ts:%Y-%m-%d %H:%M} UTC "
+        f"(возраст {age_minutes / 60:.1f} ч, допустимо {MAX_PRICE_AGE_MINUTES / 60:.1f} ч).\n\n"
+        "Пока цены не обновятся, бот НЕ входит, НЕ выходит и НЕ проверяет стоп-лосс — "
+        "решение по старой цене хуже, чем отсутствие решения.\n\n"
+        "Что это значит для тебя: открытые позиции сейчас без автоматического стопа, "
+        "следи за ними вручную. Причина почти всегда в загрузке свечей — "
+        "смотри лог последнего прогона GitHub Actions."
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--symbols", type=str,
@@ -498,6 +549,23 @@ def main():
     max_positions = args.max_positions or None
 
     conn = get_connection()
+
+    # Nothing below this is meaningful on a stale feed - bail out loudly
+    # instead of "trading" against a price from days ago.
+    age_minutes, latest_ts = price_feed_age(conn, symbols)
+    if age_minutes is None or age_minutes > MAX_PRICE_AGE_MINUTES:
+        detail = ("no ohlcv rows at all" if age_minutes is None
+                  else f"latest candle {latest_ts:%Y-%m-%d %H:%M}Z is {age_minutes:.0f}min old "
+                       f"(max {MAX_PRICE_AGE_MINUTES}min)")
+        print(f"ABORT: stale price feed - {detail}", file=sys.stderr)
+        should_alert = not stale_alert_recently_sent(conn)
+        for symbol in symbols:
+            log_tick(conn, symbol, None, None, None, "skip_stale_price", detail)
+        if should_alert and age_minutes is not None:
+            send_alert(_stale_alert_text(age_minutes, latest_ts))
+        conn.close()
+        sys.exit(1)
+
     events = load_events_with_returns(conn)
 
     client = None

@@ -1,6 +1,6 @@
 """
 Health check for the live paper-trading pipeline (2026-09-14). Run this
-any time to get a quick PASS/FAIL read on whether the hourly bot is
+any time to get a quick PASS/FAIL read on whether the live bot is
 actually alive and behaving sanely - answers "how do I know it's still
 working" without having to remember which tables/logs to check by hand.
 
@@ -16,7 +16,7 @@ import pandas as pd
 
 from db import get_connection
 
-MAX_TICK_AGE_MINUTES = 90          # hourly cadence + generous buffer
+MAX_TICK_AGE_MINUTES = 45          # real cadence is 15min (pg_cron dispatch) + buffer
 # fear_greed_index/deribit_dvol/traditional_markets all update once per DAY
 # (one row per UTC day), not hourly - only `ohlcv` is genuinely hourly.
 # Verified 2026-09-14 by inspecting each table directly (deribit_dvol's

@@ -9,28 +9,20 @@ import argparse
 import time
 from datetime import datetime, timedelta, timezone
 
-import requests
 from psycopg2.extras import execute_values
-from tenacity import retry, stop_after_attempt, wait_exponential
 
+import bybit_public
 from db import get_connection
 
-BASE_URL = "https://api.bybit.com"
 KLINE_LIMIT = 1000
 # Pegged/stablecoin-style assets: not useful for an event-dependency price study.
 STABLE_EXCLUDE = {"USDCUSDT", "XAUTUSDT", "RLUSDUSDT", "USD1USDT", "FDUSDUSDT", "TUSDUSDT", "DAIUSDT", "PYUSDUSDT"}
 
-SESSION = requests.Session()
-
-
-@retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=1, max=30))
-def _get(path, params):
-    resp = SESSION.get(f"{BASE_URL}{path}", params=params, timeout=20)
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("retCode") != 0:
-        raise RuntimeError(f"Bybit API error: {data}")
-    return data["result"]
+# 2026-09-22: no longer a direct requests.get - bybit_public.get() falls back
+# to the pg_net-inside-Postgres transport when Bybit's CloudFront geo-blocks
+# the caller, which is exactly what had been silently killing this script on
+# every GitHub Actions run since the Supabase migration. See bybit_public.py.
+_get = bybit_public.get
 
 
 def get_top_symbols(top_n: int) -> list[str]:

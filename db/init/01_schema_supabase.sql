@@ -235,3 +235,38 @@ $$;
 
 REVOKE ALL ON FUNCTION bybit_wallet_balance_start(text, jsonb) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION bybit_wallet_balance_start(text, jsonb) TO postgres;
+
+-- Public (unauthenticated) Bybit market-data proxy (2026-09-22). Same
+-- transport story as bybit_wallet_balance_start() above, but for the
+-- /v5/market/* endpoints - which turned out to be geo-blocked from
+-- GitHub Actions too, not just the signed ones. Symptom: `ohlcv` stopped
+-- gaining candles the day the bot moved to Supabase (2026-09-15) while
+-- every non-Bybit source kept updating, so the live tick was evaluating
+-- its -8% stop-loss and trend filter against a six-day-old price without
+-- anything in the logs looking wrong. No signature/Vault secret is needed
+-- here - this only carries public data - so nothing about this function
+-- can touch the account.
+--
+-- Same enqueue-only contract as the signed version: returns the pg_net
+-- request id, the CALLER polls net._http_response in a separate
+-- transaction (scripts/pg_net_proxy.py).
+CREATE OR REPLACE FUNCTION bybit_public_get_start(p_path text, p_params jsonb)
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+    v_request_id bigint;
+BEGIN
+    SELECT net.http_get(
+        url := 'https://api.bybit.com' || p_path,
+        params := coalesce(p_params, '{}'::jsonb),
+        timeout_milliseconds := 20000
+    ) INTO v_request_id;
+
+    RETURN v_request_id;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION bybit_public_get_start(text, jsonb) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION bybit_public_get_start(text, jsonb) TO postgres;
