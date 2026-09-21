@@ -158,3 +158,82 @@ CREATE TABLE IF NOT EXISTS telegram_command_cursor (
 );
 INSERT INTO telegram_command_cursor (id, last_update_id)
 VALUES (1, 0) ON CONFLICT (id) DO NOTHING;
+
+-- Bybit real-balance proxy (2026-09-21) - Supabase-only, not part of the
+-- local Docker schema. GitHub Actions runners got a confirmed geo-block
+-- (403) from Bybit's CloudFront when calling Bybit directly; a first fix
+-- via a Supabase Edge Function proxy still got geo-blocked (Edge
+-- Functions route via anycast close to the CALLER, so a GitHub-Actions
+-- call still landed on a blocked region). Postgres itself runs in one
+-- FIXED region regardless of caller, confirmed not blocked - so the
+-- actual signed Bybit call happens here, via pg_net + pgcrypto's hmac().
+-- scripts/bybit_balance.py calls this function over the normal DB
+-- connection instead of hitting Bybit directly. See
+-- project_bybit_geoblock_proxy memory for the full story.
+--
+-- Requires (run once, in the SQL Editor, not applied automatically by
+-- this file - it references Vault secrets that must exist first):
+--   SELECT vault.create_secret('<real key>', 'bybit_api_key', '...');
+--   SELECT vault.create_secret('<real secret>', 'bybit_api_secret', '...');
+CREATE OR REPLACE FUNCTION bybit_wallet_balance(p_path text, p_params jsonb)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+    v_api_key      text;
+    v_api_secret   text;
+    v_recv_window  text := '20000';
+    v_timestamp    text;
+    v_query        text;
+    v_sign         text;
+    v_url          text;
+    v_request_id   bigint;
+    v_status       int;
+    v_body         text;
+    v_tries        int := 0;
+BEGIN
+    SELECT decrypted_secret INTO v_api_key FROM vault.decrypted_secrets WHERE name = 'bybit_api_key';
+    SELECT decrypted_secret INTO v_api_secret FROM vault.decrypted_secrets WHERE name = 'bybit_api_secret';
+    v_timestamp := (extract(epoch FROM clock_timestamp()) * 1000)::bigint::text;
+
+    SELECT string_agg(key || '=' || value, '&' ORDER BY key)
+        INTO v_query
+    FROM jsonb_each_text(p_params);
+
+    v_sign := encode(
+        hmac(v_timestamp || v_api_key || v_recv_window || coalesce(v_query, ''), v_api_secret, 'sha256'),
+        'hex'
+    );
+    v_url := 'https://api.bybit.com' || p_path
+        || CASE WHEN v_query IS NOT NULL AND v_query != '' THEN '?' || v_query ELSE '' END;
+
+    SELECT net.http_get(
+        url := v_url,
+        headers := jsonb_build_object(
+            'X-BAPI-API-KEY', v_api_key,
+            'X-BAPI-TIMESTAMP', v_timestamp,
+            'X-BAPI-RECV-WINDOW', v_recv_window,
+            'X-BAPI-SIGN', v_sign
+        )
+    ) INTO v_request_id;
+
+    -- pg_net is async by design (doesn't block the caller's transaction) -
+    -- poll for up to ~6s, Bybit responds in well under 1s normally.
+    LOOP
+        SELECT status_code, content INTO v_status, v_body FROM net._http_response WHERE id = v_request_id;
+        EXIT WHEN v_status IS NOT NULL OR v_tries > 30;
+        PERFORM pg_sleep(0.2);
+        v_tries := v_tries + 1;
+    END LOOP;
+
+    IF v_status IS NULL THEN
+        RETURN jsonb_build_object('status', 0, 'body', jsonb_build_object('error', 'timeout waiting for bybit response'));
+    END IF;
+
+    RETURN jsonb_build_object('status', v_status, 'body', v_body::jsonb);
+END;
+$$;
+
+REVOKE ALL ON FUNCTION bybit_wallet_balance(text, jsonb) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION bybit_wallet_balance(text, jsonb) TO postgres;

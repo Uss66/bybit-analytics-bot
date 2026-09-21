@@ -23,70 +23,61 @@ on your real account):
      "Trade" or "Withdraw" for this key - there is no reason this key ever
      needs those, and leaving them off means even a leaked key can't move
      your funds.
-  4. The key/secret now live as Supabase Edge Function secrets
-     (BYBIT_API_KEY/BYBIT_API_SECRET on the `bybit-proxy` function), NOT
-     in this process's own .env - see the 2026-09-21 note below for why.
-     This process instead needs BYBIT_PROXY_URL (the function's invoke
-     URL) and BYBIT_PROXY_SECRET (a shared secret checked by the proxy)
-     in its own .env / GitHub Secrets.
+  4. The key/secret live in Supabase Vault (`bybit_api_key`/
+     `bybit_api_secret`), read by the `bybit_wallet_balance()` Postgres
+     function - NOT in this process's own .env. This process just needs
+     its normal POSTGRES_* connection (already required by every other
+     script) - see the 2026-09-21 note below for why.
 
-If these env vars are missing, get_usdt_balance() returns None (not an
-error) so the alerting code can gracefully omit the balance line rather
-than crash the hourly tick.
+If the DB call fails, get_usdt_balance() returns None (not an error) so
+the alerting code can gracefully omit the balance line rather than crash
+the hourly tick.
 
 Usage:
     from bybit_balance import get_usdt_balance
     bal = get_usdt_balance()  # float or None
 """
-import os
+import json
 from pathlib import Path
 
-import requests
+import psycopg2
 from dotenv import load_dotenv
+
+from db import get_connection
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 # 2026-09-21: calls no longer go straight to Bybit from here - GitHub
 # Actions runners got a confirmed 403 from Bybit's CloudFront ("configured
-# to block access from your country"), a geo-block that has nothing to do
-# with credentials/signature and can't be fixed by an IP whitelist (GH
-# Actions runner IPs aren't stable anyway). Supabase's own infra (AWS
-# eu-west-1) was confirmed NOT blocked, so the actual signed Bybit call now
-# happens in a Supabase Edge Function (supabase/functions/bybit-proxy) -
-# this module just forwards path+params to it and unwraps the response.
-# The real Bybit API key/secret now live ONLY as Supabase Edge Function
-# secrets, not in this process's environment - see
-# project_bybit_geoblock_proxy memory for the full story.
-PROXY_URL = os.environ.get("BYBIT_PROXY_URL")
-PROXY_SECRET = os.environ.get("BYBIT_PROXY_SECRET")
-_warned_missing_creds = False
-
-
-def _warn_missing_creds():
-    """One-time diagnostic print when the proxy isn't configured - mirrors
-    the 2026-09-18 finding that a silent None with zero log trace makes a
-    missing-secret problem look like a Bybit API problem. Silent None is
-    still the right return value (callers must treat it as 'unknown', not
-    '0'), but silent should not mean invisible in the log too."""
-    global _warned_missing_creds
-    if not _warned_missing_creds:
-        print("[bybit_balance] BYBIT_PROXY_URL/BYBIT_PROXY_SECRET not set - balance checks disabled "
-              "(check the workflow's env: block, or .env locally)")
-        _warned_missing_creds = True
+# to block access from your country"), a geo-block unrelated to
+# credentials/signature and not fixable by an IP whitelist. First attempt
+# fixed it via a Supabase Edge Function proxy (Supabase's DB infra tested
+# as NOT blocked) - but Edge Functions turned out to execute via anycast
+# routing close to the CALLER, so a GitHub-Actions-triggered call still
+# got routed through a blocked US region even though the exact same
+# function succeeded when called from elsewhere. Postgres itself (unlike
+# Edge Functions) runs in one FIXED region (this project's AWS eu-west-1)
+# regardless of caller, confirmed not blocked - so the actual signed Bybit
+# call now happens inside a Postgres function (bybit_wallet_balance(),
+# using pgcrypto's hmac() + pg_net) that this module invokes over the
+# same DB connection every other script already uses. See
+# project_bybit_geoblock_proxy memory for the full story of both attempts.
 
 
 def _get(path: str, params: dict) -> dict:
-    resp = requests.post(
-        PROXY_URL,
-        json={"path": path, "params": params},
-        headers={"X-Proxy-Secret": PROXY_SECRET},
-        timeout=20,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("retCode") != 0:
-        raise RuntimeError(f"Bybit API error on GET {path} (via proxy): {data}")
-    return data["result"]
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT bybit_wallet_balance(%s, %s)", (path, json.dumps(params)))
+            result = cur.fetchone()[0]
+    finally:
+        conn.close()
+    if result.get("status") != 200:
+        raise RuntimeError(f"Bybit API error on GET {path} (via pg_net): {result}")
+    body = result["body"]
+    if body.get("retCode") != 0:
+        raise RuntimeError(f"Bybit API error on GET {path}: {body}")
+    return body["result"]
 
 
 def get_usdt_balance() -> float | None:
@@ -99,9 +90,6 @@ def get_usdt_balance() -> float | None:
     0, which looked like a bug until checked directly). Returns None if
     BYBIT_API_KEY/SECRET aren't configured or the call fails - callers
     must treat None as 'unknown, don't show a figure', never as 0."""
-    if not PROXY_URL or not PROXY_SECRET:
-        _warn_missing_creds()
-        return None
     try:
         result = _get("/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": "USDT"})
         for account in result.get("list", []):
@@ -109,7 +97,7 @@ def get_usdt_balance() -> float | None:
                 if c.get("coin") == "USDT":
                     return float(c.get("walletBalance") or 0)
         return 0.0
-    except (requests.exceptions.RequestException, RuntimeError) as e:
+    except (psycopg2.Error, RuntimeError) as e:
         print(f"[bybit_balance] balance check failed (non-fatal): {e}")
         return None
 
@@ -125,9 +113,6 @@ def get_full_balance() -> dict | None:
     number, is the point - a user with funds parked in Funding but
     reading only a Unified balance of 0 would wrongly conclude they have
     nothing, exactly what happened here before this was added."""
-    if not PROXY_URL or not PROXY_SECRET:
-        _warn_missing_creds()
-        return None
     try:
         unified = _get("/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": "USDT"})
         unified_usdt = 0.0
@@ -145,7 +130,7 @@ def get_full_balance() -> dict | None:
                 funding_btc = float(c.get("walletBalance") or 0)
 
         return dict(unified_usdt=unified_usdt, funding_usdt=funding_usdt, funding_btc=funding_btc)
-    except (requests.exceptions.RequestException, RuntimeError) as e:
+    except (psycopg2.Error, RuntimeError) as e:
         print(f"[bybit_balance] full balance check failed (non-fatal): {e}")
         return None
 
@@ -161,9 +146,6 @@ def get_coin_balance(coin: str) -> float | None:
     fails - callers must treat None as 'unknown, don't suppress the
     alert', never as 'confirmed zero', so a transient API hiccup never
     silently hides a real actionable signal."""
-    if not PROXY_URL or not PROXY_SECRET:
-        _warn_missing_creds()
-        return None
     try:
         total = 0.0
         unified = _get("/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": coin})
@@ -178,7 +160,7 @@ def get_coin_balance(coin: str) -> float | None:
                 total += float(c.get("walletBalance") or 0)
 
         return total
-    except (requests.exceptions.RequestException, RuntimeError) as e:
+    except (psycopg2.Error, RuntimeError) as e:
         print(f"[bybit_balance] coin balance check failed for {coin} (non-fatal): {e}")
         return None
 
@@ -186,7 +168,7 @@ def get_coin_balance(coin: str) -> float | None:
 if __name__ == "__main__":
     full = get_full_balance()
     if full is None:
-        print("BYBIT_PROXY_URL/BYBIT_PROXY_SECRET not set, or fetch failed")
+        print("bybit_wallet_balance() call failed - check the DB connection and Vault secrets")
     else:
         print(f"Unified (tradeable): {full['unified_usdt']} USDT")
         print(f"Funding (needs transfer to trade): {full['funding_usdt']} USDT, {full['funding_btc']} BTC")

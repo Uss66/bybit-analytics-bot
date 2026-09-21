@@ -65,20 +65,11 @@ def main():
         f"cf-ray: {resp.headers.get('cf-ray')}\n"
         f"body: {body}"
     )
-    proxy_url = os.environ.get("BYBIT_PROXY_URL")
-    proxy_secret_set = bool(os.environ.get("BYBIT_PROXY_SECRET"))
-    proxy_detail = f"proxy_url={proxy_url} proxy_secret_set={proxy_secret_set}"
     try:
-        proxy_resp = requests.post(
-            proxy_url,
-            json={"path": "/v5/account/wallet-balance", "params": {"accountType": "UNIFIED", "coin": "BTC"}},
-            headers={"X-Proxy-Secret": os.environ.get("BYBIT_PROXY_SECRET", "")},
-            timeout=20,
-        )
-        proxy_detail += f"\nproxy status: {proxy_resp.status_code}\nproxy body: {proxy_resp.text[:800]}"
+        pg_net_btc = bybit_balance.get_coin_balance("BTC")
+        msg += f"\n\nvia pg_net (bybit_wallet_balance()): get_coin_balance('BTC') = {pg_net_btc}"
     except Exception as e:
-        proxy_detail += f"\nproxy call raised: {e}"
-    msg += f"\n\nvia bybit-proxy (raw): {proxy_detail}"
+        msg += f"\n\nvia pg_net (bybit_wallet_balance()): raised {e}"
 
     print(msg)
     send_alert(msg)
