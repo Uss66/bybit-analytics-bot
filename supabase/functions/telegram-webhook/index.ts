@@ -22,12 +22,24 @@ const CHAT_ID = Deno.env.get("TELEGRAM_CHAT_ID")!;
 const GITHUB_REPO = "Uss66/bybit-analytics-bot";
 const WORKFLOW_FILE = "telegram_commands.yml";
 
-// Mirrors telegram_command_handler.py's TRIGGERS - a fast pre-filter only. A
+// Mirrors telegram_command_handler.py's TRIGGERS + STOP/RESUME/STATUS_TRIGGERS
+// - a fast pre-filter only. Keep the two lists in sync: this one decides
+// whether the message is seen AT ALL. A
 // false positive here just costs one harmless extra Actions run (the Python
 // script re-checks properly and no-ops); a false negative just means this
 // message waits for the low-frequency fallback schedule instead of firing
 // instantly.
-const TRIGGERS = ["/invest", "куда вложить", "стоит ли вкладывать", "стоит ли инвестировать"];
+const TRIGGERS = [
+  "/invest", "куда вложить", "стоит ли вкладывать", "стоит ли инвестировать",
+  // Autonomous-trading controls (2026-09-22). These MUST be mirrored here:
+  // a phrase missing from this pre-filter never reaches the Python handler
+  // at all, so the command silently does nothing - which is exactly how
+  // /status came back empty the first time it was tried. A stop command
+  // that fails silently is the worst possible failure in this system.
+  "/stop", "/trade off", "стоп", "останови", "выключи торговлю",
+  "/trade on", "/resume",
+  "/status", "/trade status",
+];
 
 Deno.serve(async (req) => {
   const secretHeader = req.headers.get("X-Telegram-Bot-Api-Secret-Token");
@@ -47,7 +59,14 @@ Deno.serve(async (req) => {
   const chatId = String(message?.chat?.id ?? "");
   const isBot = message?.from?.is_bot ?? false;
 
-  const matched = chatId === CHAT_ID && !isBot && TRIGGERS.some((t) => text.includes(t));
+  // Any slash-command counts, not just the known list: a command this
+  // pre-filter has not heard of is better handled by the Python script
+  // (which no-ops on anything it does not recognise) than dropped here.
+  // The cost of a false positive is one short Actions run; the cost of a
+  // false negative is a command that silently does nothing.
+  const isCommand = text.startsWith("/");
+  const matched = chatId === CHAT_ID && !isBot &&
+    (isCommand || TRIGGERS.some((t) => text.includes(t)));
 
   if (matched) {
     // Fire-and-forget: don't block Telegram's webhook response on GitHub's
