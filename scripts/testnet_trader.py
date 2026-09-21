@@ -80,6 +80,7 @@ from strategy import (
 )
 from telegram_notify import send_alert
 from bybit_balance import get_full_balance, get_coin_balance
+from real_positions import alert_block
 
 NO_REAL_BALANCE_EPS = 1e-8  # below this, treat the real coin balance as "nothing to sell"
 
@@ -211,7 +212,8 @@ def _balance_line() -> str:
     return line
 
 
-def _entry_alert_text(symbol: str, score: float, fill_price: float, fill_qty: float, mode: str) -> str:
+def _entry_alert_text(symbol: str, score: float, fill_price: float, fill_qty: float,
+                       mode: str, real_block: str = "") -> str:
     """Builds a clear, step-by-step Russian-language alert (2026-09-14, per
     user request "пусть бот дает более четкие инструкции по заключению
     сделки на русском языке") - concrete numbers a user can act on
@@ -233,10 +235,12 @@ def _entry_alert_text(symbol: str, score: float, fill_price: float, fill_qty: fl
         f"3. Ориентировочный стоп-лосс: {stop_price:,.6g} USDT (−8% от входа) — "
         f"выставь сам, бот не делает это за тебя на реальном счёте\n\n"
         f"⚠️ Если уже держишь {symbol} по прошлому сигналу — не дублируй позицию."
+        f"{real_block}"
     )
 
 
-def _exit_alert_text(symbol: str, exit_price: float, exit_reason: str, net_ret: float, mode: str) -> str:
+def _exit_alert_text(symbol: str, exit_price: float, exit_reason: str, net_ret: float,
+                      mode: str, real_block: str = "") -> str:
     reason_ru = {
         "stop_loss": "сработал стоп-лосс (−8% от входа)",
         "natural": "сигнал угас (score вернулся к нулю или ниже)",
@@ -251,11 +255,12 @@ def _exit_alert_text(symbol: str, exit_price: float, exit_reason: str, net_ret: 
         f"1. Открой Bybit → Spot → {symbol}\n"
         f"2. Рыночный ордер SELL на весь объём {symbol.replace('USDT', '')}, "
         f"купленный по этому сигналу"
+        f"{real_block}"
     )
 
 
 def _add_alert_text(symbol: str, fill_price: float, fill_qty: float, new_avg_cost: float,
-                     tranche_count: int, mode: str) -> str:
+                     tranche_count: int, mode: str, real_block: str = "") -> str:
     base_coin = symbol.replace("USDT", "")
     new_stop_price = new_avg_cost * (1 + STOP_LOSS)
     mode_note = "бумажная сделка (симулятор)" if mode == "simulate" else f"реальный ордер размещён в режиме {mode}"
@@ -270,6 +275,7 @@ def _add_alert_text(symbol: str, fill_price: float, fill_qty: float, new_avg_cos
         f"(≈{fill_qty:.6g} {base_coin} по текущей цене)\n"
         f"3. Новая средняя цена всей позиции: {new_avg_cost:,.6g} USDT — "
         f"обновлённый ориентировочный стоп-лосс: {new_stop_price:,.6g} USDT (−8% от новой средней)"
+        f"{real_block}"
     )
 
 
@@ -330,7 +336,8 @@ def maybe_add_tranche(conn, client, mode: str, symbol: str, state: dict, price: 
     if real_balance is not None and real_balance < NO_REAL_BALANCE_EPS:
         print(f"[{symbol}] add alert suppressed - no real position to add to ({real_balance})")
     else:
-        send_alert(_add_alert_text(symbol, fill_price, fill_qty, new_avg_cost, new_tranche_count, mode))
+        send_alert(_add_alert_text(symbol, fill_price, fill_qty, new_avg_cost, new_tranche_count,
+                                    mode, alert_block(conn, symbol.replace("USDT", ""))))
 
 
 def enter_position(conn, client, mode: str, symbol: str, score: float, is_long_target: bool, price: float, dry_run: bool):
@@ -363,7 +370,8 @@ def enter_position(conn, client, mode: str, symbol: str, score: float, is_long_t
     record_tranche(conn, symbol, 0, fill_price, fill_qty, order_id)
     log_tick(conn, symbol, score, is_long_target, True, "enter", f"order {order_id} @ {fill_price}")
     print(f"[{symbol}] ENTERED at {fill_price}, qty {fill_qty}, order {order_id}")
-    send_alert(_entry_alert_text(symbol, score, fill_price, fill_qty, mode))
+    send_alert(_entry_alert_text(symbol, score, fill_price, fill_qty, mode,
+                                  alert_block(conn, symbol.replace("USDT", ""))))
 
 
 def process_symbol(conn, client, mode: str, symbol: str, events: pd.DataFrame, dry_run: bool):
@@ -490,7 +498,8 @@ def process_symbol(conn, client, mode: str, symbol: str, events: pd.DataFrame, d
     if real_balance is not None and real_balance < NO_REAL_BALANCE_EPS:
         print(f"[{symbol}] exit alert suppressed - no real balance to sell ({real_balance})")
     else:
-        send_alert(_exit_alert_text(symbol, exit_price, exit_reason, net_ret, mode))
+        send_alert(_exit_alert_text(symbol, exit_price, exit_reason, net_ret, mode,
+                                     alert_block(conn, symbol.replace("USDT", ""))))
 
 
 def price_feed_age(conn, symbols: list[str]):

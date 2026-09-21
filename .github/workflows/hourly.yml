@@ -55,6 +55,21 @@ jobs:
           BYBIT_API_SECRET: ${{ secrets.BYBIT_API_SECRET }}
         run: python refresh_live_data.py
 
+      # Keeps the real-money ledger (real_executions) current: Convert
+      # records plus any spot fills. Best-effort on purpose - it feeds the
+      # "your real average cost / real stop" block in alerts, and a Bybit
+      # hiccup there must never stop the tick from trading.
+      - name: Sync real executions
+        continue-on-error: true
+        working-directory: scripts
+        env:
+          POSTGRES_HOST: ${{ secrets.POSTGRES_HOST }}
+          POSTGRES_PORT: ${{ secrets.POSTGRES_PORT }}
+          POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
+        run: python real_positions.py --days 30
+
       # `if: always()` on purpose (2026-09-22): when the data refresh fails
       # the job must still go red, but the trader must still RUN - it is the
       # thing that notices a stale price feed, halts trading and sends the

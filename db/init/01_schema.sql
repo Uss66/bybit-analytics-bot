@@ -286,3 +286,31 @@ CREATE TABLE IF NOT EXISTS tracked_persons (
     truth_social_handle TEXT,
     notes              TEXT
 );
+
+-- The user's REAL fills (2026-09-22) - the ledger behind
+-- scripts/real_positions.py. Two sources feed it: Bybit Convert
+-- (/v5/asset/exchange/order-record), where every historical purchase
+-- actually happened, and real spot fills (/v5/execution/list), which
+-- were empty at creation time and start arriving once trading moves to
+-- spot orders. `price` is always the EFFECTIVE price (USDT moved / coin
+-- received), so Convert's ~1.4% embedded spread is inside the recorded
+-- cost basis rather than hidden next to it.
+--
+-- Exists because the live bot's -8% stop had been measured from a
+-- SIMULATED 100 USDT fill with no connection to the real account - for
+-- BNB the paper average sat ~11% below the real one, i.e. a real -8%
+-- could pass unnoticed. See README "Convert против спота".
+CREATE TABLE IF NOT EXISTS real_executions (
+    source      TEXT NOT NULL,              -- 'convert' | 'spot'
+    exec_id     TEXT NOT NULL,              -- exchangeTxId / execId
+    ts          TIMESTAMPTZ NOT NULL,
+    coin        TEXT NOT NULL,              -- base asset, e.g. BTC
+    side        TEXT NOT NULL,              -- BUY | SELL, in USDT terms
+    qty         DOUBLE PRECISION NOT NULL,  -- coin amount, net of any coin-denominated fee
+    quote_qty   DOUBLE PRECISION NOT NULL,  -- USDT actually moved
+    price       DOUBLE PRECISION NOT NULL,  -- effective, spread/fee included
+    fee_quote   DOUBLE PRECISION,           -- explicit fee in USDT (spot only; NULL for convert)
+    raw         JSONB NOT NULL,
+    PRIMARY KEY (source, exec_id)
+);
+CREATE INDEX IF NOT EXISTS idx_real_executions_coin_ts ON real_executions (coin, ts);
