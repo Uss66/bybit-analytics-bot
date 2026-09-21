@@ -33,11 +33,29 @@ a signal can persist for many ticks while nothing happens. An alert goes
 out when the recommended action CHANGES, or once every REMIND_HOURS
 while it stands - not every 15 minutes.
 
-Nothing here can place an order. It reads the account and sends text.
+EXECUTION (--execute, added 2026-09-22 at the user's request: "очень
+много рисков, что я не смогу среагировать например во время сна"). With
+the flag AND `trading_config.enabled` both true, the same decisions are
+sent to the exchange instead of to the user. The flag alone is not
+enough on purpose - a stray --execute in a workflow file cannot start
+trading an account whose owner switched it off in the database.
+
+Every buy is followed immediately by a STOP-LOSS ORDER ON THE EXCHANGE,
+re-placed whenever a dip-rebuy add moves the average cost and cancelled
+on exit. That resting order, not this 15-minute loop, is the real answer
+to "what if it crashes while I am asleep": it lives on Bybit's matching
+engine and fires in milliseconds even when this code, GitHub Actions,
+Supabase and Telegram are all down at once.
+
+Limits live in `trading_config` (see db/setup_trading.sql) and are
+checked by trading_guard before every order: master switch, per-order
+size, total capital the bot may deploy, and a 24h realized-loss limit
+that switches the bot off by itself.
 
 Usage:
-    python scripts/live_advisor.py            # one pass, alerts on
+    python scripts/live_advisor.py            # advice only (default)
     python scripts/live_advisor.py --dry-run  # decide and print, never send
+    python scripts/live_advisor.py --execute  # place real orders, if enabled in the DB
 """
 import argparse
 import sys
@@ -45,9 +63,11 @@ from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
+import bybit_orders
+import trading_guard
 from bybit_balance import get_full_balance
 from db import get_connection
-from real_positions import positions as real_positions
+from real_positions import positions as real_positions, fetch_spot_executions, upsert_executions
 from strategy import load_events_with_returns, generate_signals, compute_score_series
 from telegram_notify import send_alert
 from testnet_trader import (
@@ -192,6 +212,124 @@ def sell_text(symbol, price, reason, pos):
     )
 
 
+def _refresh_ledger(conn, coin: str) -> dict | None:
+    """Pull the just-placed fill into the ledger immediately instead of
+    waiting for the next tick's sync, so the stop-loss that follows is
+    computed from the REAL average cost rather than a projection."""
+    try:
+        upsert_executions(conn, fetch_spot_executions(conn, days=1))
+    except Exception as e:
+        print(f"[{coin}] could not refresh the ledger right after the fill: {e}")
+    return real_positions(conn, coin).get(coin)
+
+
+def cancel_stop_order(conn, symbol: str, state: dict) -> None:
+    """A resting stop must never outlive the position it protects: left
+    behind, it would one day sell coins the bot no longer manages."""
+    link_id = state.get("stop_order_link_id")
+    if not link_id:
+        return
+    try:
+        bybit_orders.cancel_order(symbol, link_id=link_id, stop_order=True, conn=conn)
+        print(f"[{symbol}] cancelled the resting stop order")
+    except bybit_orders.OrderRejected as e:
+        # Already gone (triggered or cancelled by hand) is a fine outcome.
+        print(f"[{symbol}] stop order could not be cancelled ({e.ret_msg}) - assuming it is gone")
+    save_advisor_state(conn, symbol, stop_order_link_id=None, stop_trigger_price=None)
+
+
+def ensure_stop_order(conn, symbol: str, pos: dict, state: dict) -> str:
+    """Place (or re-place) the exchange-side stop for the whole position.
+
+    This is the protection that actually answers 'what if it drops while
+    I am asleep': it sits on Bybit's matching engine and fires in
+    milliseconds even if this code, GitHub Actions, Supabase and Telegram
+    are all down. The bot's own 15-minute check stays as the second line.
+
+    Re-placed after every add, because a dip-rebuy add lowers the average
+    cost and therefore moves the -8% level down with it."""
+    trigger = pos["avg_cost"] * (1 + STOP_LOSS)
+    if state.get("stop_order_link_id") and state.get("stop_trigger_price"):
+        if abs(state["stop_trigger_price"] - trigger) / trigger < 1e-6:
+            return "стоп на бирже уже стоит"
+        cancel_stop_order(conn, symbol, state)
+
+    link_id = bybit_orders.make_link_id(symbol, "stop")
+    request = dict(symbol=symbol, qty=pos["qty"], trigger=trigger)
+    row = trading_guard.record_order(conn, symbol, "stop_order", link_id, request,
+                                     reason=f"-8% of real avg {pos['avg_cost']:.6g}")
+    try:
+        result = bybit_orders.place_stop_loss(symbol, pos["qty"], trigger, link_id, conn=conn)
+    except bybit_orders.OrderRejected as e:
+        trading_guard.finish_order(conn, row, "rejected", response=e.body, pnl_usdt=None)
+        return (f"⚠️ стоп-ордер на бирже НЕ принят ({e.ret_msg}) — "
+                f"позиция защищена только проверкой бота раз в 15 минут")
+    trading_guard.finish_order(conn, row, "accepted", order_id=result.get("orderId"), response=result)
+    save_advisor_state(conn, symbol, stop_order_link_id=link_id, stop_trigger_price=trigger)
+    return f"стоп-ордер выставлен на бирже: {_fmt(trigger)} USDT"
+
+
+def execute_buy(conn, symbol: str, stake: float, price: float, intent: str, pos: dict | None) -> str:
+    """Buy, then immediately protect. Returns the text to send."""
+    coin = symbol.replace("USDT", "")
+    link_id = bybit_orders.make_link_id(symbol, intent)
+    row = trading_guard.record_order(conn, symbol, intent, link_id,
+                                     dict(symbol=symbol, stake_usdt=stake, price=price),
+                                     reason=f"score-driven {intent}")
+    try:
+        result = bybit_orders.market_buy(symbol, stake, link_id, conn=conn)
+    except bybit_orders.OrderRejected as e:
+        trading_guard.finish_order(conn, row, "rejected", response=e.body)
+        return f"⚠️ ПОКУПКА {symbol} НЕ ПРОШЛА\n\nBybit отклонил ордер: {e.ret_msg}"
+    trading_guard.finish_order(conn, row, "accepted", order_id=result.get("orderId"), response=result)
+    trading_guard.note_bot_buy(conn, symbol, stake)
+
+    new_pos = _refresh_ledger(conn, coin) or pos
+    state = load_advisor_state(conn, symbol)
+    stop_note = ensure_stop_order(conn, symbol, new_pos, state) if new_pos else "позиция ещё не видна в реестре"
+    head = "КУПЛЕНО" if intent == "buy" else "ДОКУПЛЕНО НА ОТСКОКЕ"
+    avg_line = (f"Средняя цена позиции: {_fmt(new_pos['avg_cost'])} USDT\n" if new_pos else "")
+    return (
+        f"\U00002705 {head} — {symbol}\n\n"
+        f"Потрачено: {stake:,.2f} USDT по цене ≈{_fmt(price)}\n"
+        f"{avg_line}"
+        f"{stop_note}\n\n"
+        f"Ордер: {result.get('orderId')}"
+    )
+
+
+def execute_sell(conn, symbol: str, pos: dict, price: float, reason: str) -> str:
+    coin = symbol.replace("USDT", "")
+    state = load_advisor_state(conn, symbol)
+    cancel_stop_order(conn, symbol, state)
+
+    intent = "sell_stop" if reason == "stop_loss" else "sell_signal"
+    link_id = bybit_orders.make_link_id(symbol, intent)
+    pnl = (price - pos["avg_cost"]) * pos["qty"]
+    row = trading_guard.record_order(conn, symbol, intent, link_id,
+                                     dict(symbol=symbol, qty=pos["qty"], price=price), reason=reason)
+    try:
+        result = bybit_orders.market_sell(symbol, pos["qty"], link_id, conn=conn)
+    except bybit_orders.OrderRejected as e:
+        trading_guard.finish_order(conn, row, "rejected", response=e.body)
+        return (f"⚠️ ПРОДАЖА {symbol} НЕ ПРОШЛА\n\nBybit отклонил ордер: {e.ret_msg}\n"
+                f"Позиция всё ещё открыта — посмотри вручную.")
+    trading_guard.finish_order(conn, row, "accepted", order_id=result.get("orderId"),
+                               response=result, pnl_usdt=pnl)
+    trading_guard.note_bot_exit(conn, symbol)
+    _refresh_ledger(conn, coin)
+
+    reason_ru = {"stop_loss": "стоп-лосс: −8% от реальной средней",
+                 "signal_gone": "сигнал угас"}[reason]
+    return (
+        f"\U00002705 ПРОДАНО — {symbol}\n\n"
+        f"Причина: {reason_ru}\n"
+        f"Продано {pos['qty']:,.8g} {coin} по ≈{_fmt(price)} USDT\n"
+        f"Результат: {pnl:+,.2f} USDT ({(price / pos['avg_cost'] - 1):+.2%})\n\n"
+        f"Ордер: {result.get('orderId')}"
+    )
+
+
 def should_alert(state: dict, action: str) -> bool:
     """Quiet while nothing changes, but not silent forever: the user may
     simply not have seen the first message."""
@@ -206,6 +344,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--symbols", type=str, default=",".join(SYMBOLS))
     parser.add_argument("--dry-run", action="store_true", help="Decide and print, never send or save")
+    parser.add_argument("--execute", action="store_true",
+                        help="Place real orders instead of only advising. Still subject to every "
+                             "guard in trading_config - with enabled=false this flag does nothing.")
     parser.add_argument("--max-positions", type=int, default=MAX_POSITIONS)
     args = parser.parse_args()
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
@@ -229,6 +370,24 @@ def main():
     held = {s for s in symbols if (book.get(s.replace("USDT", "")) or {}).get("qty", 0) > DUST}
     free_slots = max(0, (args.max_positions or len(symbols)) - len(held))
     print(f"Real book: {sorted(held) or 'empty'} | free USDT {free_usdt:,.2f} | free slots {free_slots}")
+
+    # Autonomy is off unless BOTH the flag and the database say so. The
+    # flag alone cannot trade - that way a stray --execute in a workflow
+    # or a shell history cannot start trading an account whose owner
+    # switched it off.
+    config = trading_guard.load_config(conn)
+    executing = False
+    if args.execute and not args.dry_run:
+        try:
+            trading_guard.check_can_trade(conn, config)
+            executing = True
+        except trading_guard.TradingBlocked as e:
+            print(f"Execution disabled: {e}")
+            if "daily loss limit" in str(e):
+                send_alert(f"\U0001F6D1 АВТОТОРГОВЛЯ ОСТАНОВЛЕНА\n\n{e}")
+    print(f"Mode: {'EXECUTING REAL ORDERS' if executing else 'advice only'}"
+          + (f" | cap {config['max_capital_usdt']:,.0f} USDT, "
+             f"deployed {trading_guard.bot_deployed_usdt(conn):,.2f}" if executing else ""))
 
     candidates = []
     for symbol in symbols:
@@ -262,10 +421,22 @@ def main():
             continue
 
         # ---- holding: stop, exit, or dip-rebuy add ----
+        # While executing, the exchange-side stop is kept in sync on every
+        # tick - a position whose stop went missing (cancelled by hand, or
+        # an add that moved the average) is a position with no protection
+        # between ticks, which is the whole thing this is meant to prevent.
+        if executing and not state.get("stop_order_link_id"):
+            print(f"[{symbol}] no resting stop - placing one: {ensure_stop_order(conn, symbol, pos, state)}")
+            state = load_advisor_state(conn, symbol)
+
         if price / pos["avg_cost"] - 1 <= STOP_LOSS:
-            action, text = "sell_stop", sell_text(symbol, price, "stop_loss", pos)
+            action = "sell_stop"
+            text = (execute_sell(conn, symbol, pos, price, "stop_loss") if executing
+                    else sell_text(symbol, price, "stop_loss", pos))
         elif not score > 0:
-            action, text = "sell_signal", sell_text(symbol, price, "signal_gone", pos)
+            action = "sell_signal"
+            text = (execute_sell(conn, symbol, pos, price, "signal_gone") if executing
+                    else sell_text(symbol, price, "signal_gone", pos))
         else:
             running_low = min(state["running_low"] or price, price)
             tranches = state["tranche_count"] or 1
@@ -277,7 +448,17 @@ def main():
                 save_advisor_state(conn, symbol, running_low=running_low)
             if add_now:
                 stake = free_usdt / max(free_slots, 1) if free_usdt >= MIN_ORDER_USDT else 0.0
-                action, text = "add", add_text(symbol, price, stake, pos, tranches + 1)
+                action = "add"
+                if executing and stake >= MIN_ORDER_USDT:
+                    try:
+                        stake = trading_guard.check_order(conn, config, stake)
+                        text = execute_buy(conn, symbol, stake, price, "add", pos)
+                    except trading_guard.TradingBlocked as e:
+                        action = "add_blocked"
+                        text = (f"\U000026A0 ДОКУПКА {symbol} пропущена\n\n{e}\n\n"
+                                f"Сигнал на докупку был, лимиты не дали его исполнить.")
+                else:
+                    text = add_text(symbol, price, stake, pos, tranches + 1)
                 if not args.dry_run:
                     save_advisor_state(conn, symbol, tranche_count=tranches + 1, running_low=price)
             else:
@@ -311,6 +492,18 @@ def main():
         stake = free_usdt / free_slots if free_usdt >= MIN_ORDER_USDT else 0.0
         action = "buy" if stake else "buy_no_funds"
         text = buy_text(symbol, c["score"], c["price"], stake, free_usdt, funding_note)
+        if executing and stake >= MIN_ORDER_USDT:
+            try:
+                # The guard can TRIM the stake (e.g. the cap leaves room for
+                # 80 of the 120 the sizing rule wanted) - a smaller trade is
+                # a fine outcome, silently skipping the signal is not.
+                stake = trading_guard.check_order(conn, config, stake)
+                text = execute_buy(conn, symbol, stake, c["price"], "buy", None)
+                action = "buy_executed"
+            except trading_guard.TradingBlocked as e:
+                action = "buy_blocked"
+                text = (f"\U000026A0 ВХОД {symbol} пропущен\n\n{e}\n\n"
+                        f"Сигнал был (score {c['score']:.1f}), лимиты не дали его исполнить.")
         if should_alert(state, action):
             print(f"[{symbol}] ADVICE {action} (stake {stake:,.2f})")
             if not args.dry_run:

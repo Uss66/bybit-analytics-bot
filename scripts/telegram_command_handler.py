@@ -57,6 +57,7 @@ from strategy import load_events_with_returns, generate_signals, compute_score_s
 from telegram_notify import send_alert, CHAT_ID
 from testnet_trader import MAX_POSITIONS, TREND_FILTER_SMA, NO_REAL_BALANCE_EPS
 from bybit_balance import get_coin_balance
+import trading_guard
 
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "BNBUSDT", "LINKUSDT"]
 
@@ -65,6 +66,14 @@ SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "BNBUSDT", "L
 # list short and specific rather than matching on loose keywords like
 # "крипта" alone, so casual chat in the group never accidentally fires it.
 TRIGGERS = ["/invest", "куда вложить", "стоит ли вкладывать", "стоит ли инвестировать"]
+
+# Autonomous-trading controls (2026-09-22). Deliberately generous on the
+# STOP side and strict on the resume side: a false positive on "стоп"
+# costs one missed signal, a false positive on "включить" costs real
+# money. /stop is checked before every other trigger.
+STOP_TRIGGERS = ["/stop", "/trade off", "стоп", "останови", "выключи торговлю"]
+RESUME_TRIGGERS = ["/trade on", "/resume"]
+STATUS_TRIGGERS = ["/status", "/trade status"]
 
 
 def compute_signal_snapshot(conn) -> pd.DataFrame:
@@ -194,6 +203,38 @@ def build_reply(conn) -> str:
     return "\n".join(lines)
 
 
+def trading_status_text(conn) -> str:
+    """What the bot is allowed to do right now, and what it has done -
+    the answer to "is it still running and what did it get up to while I
+    was asleep", without opening a dashboard."""
+    config = trading_guard.load_config(conn)
+    deployed = trading_guard.bot_deployed_usdt(conn)
+    pnl24 = trading_guard.realized_pnl_24h(conn)
+    orders = trading_guard.recent_orders(conn, hours=24)
+
+    head = "\U00002705 Автоторговля ВКЛЮЧЕНА" if config["enabled"] else "\U0001F6D1 Автоторговля ВЫКЛЮЧЕНА"
+    if not config["enabled"] and config.get("paused_reason"):
+        head += f"\nПричина: {config['paused_reason']}"
+
+    lines = [
+        head, "",
+        f"Задействовано ботом: {deployed:,.2f} из {config['max_capital_usdt']:,.0f} USDT",
+        f"Максимум на ордер: {config['max_order_usdt']:,.0f} USDT",
+        f"Реализовано за 24ч: {pnl24:+,.2f} USDT "
+        f"(лимит убытка {config['max_daily_loss_usdt']:,.0f})",
+        "",
+    ]
+    if orders:
+        lines.append(f"Ордеров за 24ч: {len(orders)}")
+        for o in orders[:8]:
+            pnl = f"  {o['pnl_usdt']:+,.2f} USDT" if o["pnl_usdt"] is not None else ""
+            lines.append(f"  {o['ts']:%d.%m %H:%M} {o['symbol']} {o['intent']} — {o['status']}{pnl}")
+    else:
+        lines.append("Ордеров за последние 24 часа не было.")
+    lines += ["", "Команды: /stop — остановить, /trade on — включить, /status — этот отчёт"]
+    return "\n".join(lines)
+
+
 def main():
     raw = os.environ.get("TELEGRAM_UPDATE_JSON", "").strip()
     if not raw:
@@ -213,6 +254,46 @@ def main():
         return
 
     text = (message.get("text") or "").strip().lower()
+
+    # The kill switch comes first, and is matched before anything else:
+    # when the user types "стоп" they need the bot to stop, not to think
+    # about what else the message might have meant. It writes to
+    # trading_config, which every tick reads before placing anything, so
+    # the next tick (<=15 min) trades nothing - no deploy, no git push.
+    if any(t in text for t in STOP_TRIGGERS):
+        conn = get_connection()
+        trading_guard.pause(conn, f"stopped from Telegram by {message.get('from', {}).get('username', 'user')}")
+        conn.close()
+        send_alert("\U0001F6D1 АВТОТОРГОВЛЯ ОСТАНОВЛЕНА\n\n"
+                   "Новых ордеров бот больше не отправляет. Уже открытые позиции остаются как есть, "
+                   "и выставленные на бирже стоп-ордера продолжают их защищать.\n\n"
+                   "Включить обратно: /trade on")
+        print("[telegram_command_handler] autotrading paused from Telegram")
+        return
+
+    if any(t in text for t in RESUME_TRIGGERS):
+        conn = get_connection()
+        with conn.cursor() as cur:
+            cur.execute("UPDATE trading_config SET enabled = true, paused_reason = NULL, "
+                        "paused_at = NULL, updated_at = now() WHERE id = 1")
+        conn.commit()
+        config = trading_guard.load_config(conn)
+        conn.close()
+        send_alert(f"\U00002705 АВТОТОРГОВЛЯ ВКЛЮЧЕНА\n\n"
+                   f"Потолок капитала: {config['max_capital_usdt']:,.0f} USDT\n"
+                   f"Максимум на один ордер: {config['max_order_usdt']:,.0f} USDT\n"
+                   f"Дневной лимит убытка: {config['max_daily_loss_usdt']:,.0f} USDT\n\n"
+                   f"Остановить в любой момент: /stop")
+        print("[telegram_command_handler] autotrading enabled from Telegram")
+        return
+
+    if any(t in text for t in STATUS_TRIGGERS):
+        conn = get_connection()
+        send_alert(trading_status_text(conn))
+        conn.close()
+        print("[telegram_command_handler] replied with trading status")
+        return
+
     if not any(trigger in text for trigger in TRIGGERS):
         print("[telegram_command_handler] update did not match any trigger")
         return

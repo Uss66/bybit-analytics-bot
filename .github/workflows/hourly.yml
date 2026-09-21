@@ -91,8 +91,12 @@ jobs:
           BYBIT_API_SECRET: ${{ secrets.BYBIT_API_SECRET }}
         run: python testnet_trader.py --mode simulate --no-alerts
 
-      # The layer the user actually reads: decides from the REAL position
+      # The layer that acts: decides from the REAL position
       # (real_executions ledger + real free balance), not the paper book.
+      # --execute is passed unconditionally, but it only DOES anything
+      # when trading_config.enabled is true in the database - so turning
+      # autonomous trading on or off never needs a commit, and /stop in
+      # Telegram takes effect on the very next tick.
       # Runs after the paper tick so both see the same refreshed data, and
       # only if the feed is fresh - it exits non-zero on a stale feed, but
       # the alarm for that is the trader's job, not a second message here.
@@ -107,4 +111,4 @@ jobs:
           POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python live_advisor.py
+        run: python live_advisor.py --execute
