@@ -84,6 +84,15 @@ from real_positions import alert_block
 
 NO_REAL_BALANCE_EPS = 1e-8  # below this, treat the real coin balance as "nothing to sell"
 
+# 2026-09-22: since live_advisor.py now owns every message the user acts
+# on (it reasons about the REAL position, this script about a simulated
+# one), the paper tick runs with --no-alerts in CI so the two never send
+# two versions of the same advice. The stale-price alarm is deliberately
+# NOT suppressed by the flag: it is about the pipeline being broken, it
+# has no advisor equivalent, and silencing it would recreate exactly the
+# blind spot that cost six days of dead price feed.
+TRADE_ALERTS_ENABLED = True
+
 STOP_LOSS = -0.08
 TREND_FILTER_SMA = 720
 COOLDOWN_AFTER_LOSSES = 3
@@ -122,6 +131,15 @@ MAX_POSITIONS = 3  # portfolio-wide cap on simultaneous open positions, added 20
 # risk-adjusted (return/drawdown) ratio of any cap on BOTH train (4.94x) and holdout
 # (6.25x), see README.md "Портфельный лимит экспозиции". Ties at the same tick
 # (routine here - fgi_greed/DVOL are market-wide) are broken by highest score first.
+
+
+def send_trade_alert(text: str):
+    """Entry/add/exit alerts go through here so --no-alerts can mute them
+    in one place; the stale-price alarm calls send_alert directly."""
+    if not TRADE_ALERTS_ENABLED:
+        print("[alerts off] trade alert suppressed - live_advisor.py owns user-facing advice")
+        return False
+    return send_alert(text)
 
 
 def load_state(conn, symbol: str) -> dict:
@@ -336,7 +354,7 @@ def maybe_add_tranche(conn, client, mode: str, symbol: str, state: dict, price: 
     if real_balance is not None and real_balance < NO_REAL_BALANCE_EPS:
         print(f"[{symbol}] add alert suppressed - no real position to add to ({real_balance})")
     else:
-        send_alert(_add_alert_text(symbol, fill_price, fill_qty, new_avg_cost, new_tranche_count,
+        send_trade_alert(_add_alert_text(symbol, fill_price, fill_qty, new_avg_cost, new_tranche_count,
                                     mode, alert_block(conn, symbol.replace("USDT", ""))))
 
 
@@ -370,7 +388,7 @@ def enter_position(conn, client, mode: str, symbol: str, score: float, is_long_t
     record_tranche(conn, symbol, 0, fill_price, fill_qty, order_id)
     log_tick(conn, symbol, score, is_long_target, True, "enter", f"order {order_id} @ {fill_price}")
     print(f"[{symbol}] ENTERED at {fill_price}, qty {fill_qty}, order {order_id}")
-    send_alert(_entry_alert_text(symbol, score, fill_price, fill_qty, mode,
+    send_trade_alert(_entry_alert_text(symbol, score, fill_price, fill_qty, mode,
                                   alert_block(conn, symbol.replace("USDT", ""))))
 
 
@@ -498,7 +516,7 @@ def process_symbol(conn, client, mode: str, symbol: str, events: pd.DataFrame, d
     if real_balance is not None and real_balance < NO_REAL_BALANCE_EPS:
         print(f"[{symbol}] exit alert suppressed - no real balance to sell ({real_balance})")
     else:
-        send_alert(_exit_alert_text(symbol, exit_price, exit_reason, net_ret, mode,
+        send_trade_alert(_exit_alert_text(symbol, exit_price, exit_reason, net_ret, mode,
                                      alert_block(conn, symbol.replace("USDT", ""))))
 
 
@@ -547,6 +565,9 @@ def main():
                          help="'simulate' fills locally at the public close price, no exchange account "
                               "needed (default). 'testnet' places real fake-money orders via Bybit's "
                               "testnet API (needs BYBIT_TESTNET_API_KEY/SECRET).")
+    parser.add_argument("--no-alerts", action="store_true",
+                         help="Suppress entry/add/exit Telegram alerts (live_advisor.py sends those "
+                              "from the REAL position instead). The stale-price alarm still fires.")
     parser.add_argument("--dry-run", action="store_true",
                          help="Compute signals and log what WOULD happen, but never record a trade.")
     parser.add_argument("--max-positions", type=int, default=MAX_POSITIONS,
@@ -555,6 +576,8 @@ def main():
                               f"- see README.md). Pass 0 to disable.")
     args = parser.parse_args()
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    global TRADE_ALERTS_ENABLED
+    TRADE_ALERTS_ENABLED = not args.no_alerts
     max_positions = args.max_positions or None
 
     conn = get_connection()

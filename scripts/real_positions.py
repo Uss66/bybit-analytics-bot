@@ -333,9 +333,68 @@ def alert_block(conn, coin: str, check_balance: bool = True) -> str:
     return block
 
 
+def true_up(conn, coin: str, price: float | None = None) -> dict | None:
+    """Records the drift between ledger and exchange as an explicit
+    adjustment row, so the ledger's quantity matches what is actually
+    held. Returns the recorded row, or None when there was nothing to fix.
+
+    Needed because not every coin movement is visible to a read-only key:
+    the user converted BTC out through a path that appears on NO endpoint
+    this key can read (checked every page of Convert history, all five
+    convert account types, withdrawals in 30-day windows over six months,
+    internal transfers and Earn - all empty), and the key has no Withdraw
+    scope to see it directly.
+
+    Crucially this does NOT distort the stop: weighted-average accounting
+    removes cost AT THE AVERAGE, so the remaining position keeps exactly
+    the average cost - and therefore the stop price - it had before. Only
+    realized P&L is affected, and it is approximate by construction
+    (priced at the current market unless a price is given), which is why
+    the row is stored with source='adjustment' rather than pretending to
+    be a trade."""
+    pos = positions(conn, coin).get(coin)
+    if not pos or not pos["qty"]:
+        print(f"[real_positions] no ledger position in {coin} to true up")
+        return None
+    real = get_coin_balance(coin)
+    if real is None:
+        print(f"[real_positions] balance for {coin} unknown - refusing to true up on a guess")
+        return None
+
+    drift = real - pos["qty"]
+    if abs(drift) <= max(1e-8, pos["qty"] * 1e-6):
+        print(f"[real_positions] {coin} already matches the exchange")
+        return None
+    if price is None:
+        price = latest_prices(conn, [coin]).get(coin)
+        if price is None:
+            print(f"[real_positions] no price for {coin} - pass --price explicitly")
+            return None
+
+    side = "SELL" if drift < 0 else "BUY"
+    qty = abs(drift)
+    now = datetime.now(timezone.utc)
+    row = dict(
+        source="adjustment", exec_id=f"trueup-{coin}-{int(now.timestamp())}", ts=now,
+        coin=coin, side=side, qty=qty, quote_qty=qty * price, price=price, fee_quote=None,
+        raw=dict(reason="ledger/exchange drift with no readable record on any endpoint",
+                 ledger_qty=pos["qty"], exchange_qty=real, priced_at=price),
+    )
+    upsert_executions(conn, [row])
+    print(f"[real_positions] {coin}: recorded {side} {qty:.8f} at {price:,.2f} "
+          f"(ledger {pos['qty']:.8f} -> exchange {real:.8f})")
+    return row
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--report", action="store_true", help="Skip the API sync, report what's stored")
+    parser.add_argument("--true-up", type=str, metavar="COIN",
+                        help="Record the ledger-vs-exchange drift for COIN as an explicit adjustment "
+                             "(use when coins moved through a path the API cannot show). The remaining "
+                             "position keeps its average cost, so the stop level does not move.")
+    parser.add_argument("--price", type=float, default=None,
+                        help="Price to value a --true-up adjustment at (default: latest close)")
     parser.add_argument("--days", type=int, default=DEFAULT_BACKFILL_DAYS,
                         help=f"How far back to walk spot executions (default {DEFAULT_BACKFILL_DAYS})")
     parser.add_argument("--no-reconcile", action="store_true",
@@ -343,6 +402,11 @@ def main():
     args = parser.parse_args()
 
     conn = get_connection()
+    if args.true_up:
+        true_up(conn, args.true_up.upper(), args.price)
+        report(conn, check_balances=not args.no_reconcile)
+        conn.close()
+        return
     if not args.report:
         convert_rows = fetch_convert_records(conn)
         spot_rows = fetch_spot_executions(conn, args.days)

@@ -300,6 +300,34 @@ CREATE TABLE IF NOT EXISTS tracked_persons (
 -- SIMULATED 100 USDT fill with no connection to the real account - for
 -- BNB the paper average sat ~11% below the real one, i.e. a real -8%
 -- could pass unnoticed. See README "Convert против спота".
+-- Advice state, separate from the paper book (2026-09-22). testnet_state
+-- tracks the SIMULATED position (the strategy's own uninterrupted track
+-- record); this table tracks what the user was last TOLD to do about the
+-- REAL one. They are deliberately not the same thing: the paper book held
+-- BTC/BNB/LINK/XRP while the exchange held only BTC and BNB.
+--
+-- `last_action` + `last_alert_ts` exist because this bot cannot act for
+-- the user: a recommendation can stand for hundreds of 15-minute ticks
+-- while nothing happens, and re-sending it every tick would train the
+-- user to ignore the alerts. An alert goes out when the recommendation
+-- CHANGES, or once every few hours while it stands.
+--
+-- `last_realized_pnl` is the ledger's realized P&L for that coin as of
+-- the last time this table was updated - the delta is how the advisor
+-- notices the user actually sold, and whether that sale was a loss (which
+-- feeds the post-loss cooldown).
+CREATE TABLE IF NOT EXISTS advisor_state (
+    symbol             TEXT PRIMARY KEY,
+    last_action        TEXT,
+    last_alert_ts      TIMESTAMPTZ,
+    running_low        DOUBLE PRECISION,
+    tranche_count      INT NOT NULL DEFAULT 0,
+    consecutive_losses INT NOT NULL DEFAULT 0,
+    cooldown_until_ts  TIMESTAMPTZ,
+    last_realized_pnl  DOUBLE PRECISION NOT NULL DEFAULT 0,
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS real_executions (
     source      TEXT NOT NULL,              -- 'convert' | 'spot'
     exec_id     TEXT NOT NULL,              -- exchangeTxId / execId
