@@ -6,6 +6,19 @@ name: Hourly live trading tick
 # capacity shortages, so the bot moved to ephemeral GitHub Actions runs
 # against a Supabase Postgres instead of a persistent VM.
 #
+# NOTE (2026-09-21): despite the filename/display name, this no longer
+# actually runs on GitHub's own `schedule:` clock below - that trigger is
+# kept ONLY as a free, no-cost fallback, since GitHub's `schedule:` events
+# were confirmed unreliable by hours-to-days (see
+# project_github_actions_cron_reliability memory). The REAL trigger is a
+# Supabase pg_cron job ('hourly-tick-dispatch') that calls this workflow's
+# `workflow_dispatch` REST endpoint every 15 minutes (tightened from 60min
+# on 2026-09-21 to shrink the worst-case detection latency for a sharp
+# price drop - the fixed -8% stop-loss can only fire when a tick actually
+# runs, so a longer gap between ticks means more possible slippage past
+# -8% before the bot notices). Check `SELECT * FROM cron.job;` in Supabase
+# to see/change the real schedule, not this file's `cron:` line.
+#
 # Timed at :05, not :00, on GitHub's own advice - scheduled workflows can
 # be delayed during exact-hour load spikes across all of GitHub Actions.
 on:
