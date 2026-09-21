@@ -283,6 +283,10 @@ def execute_buy(conn, symbol: str, stake: float, price: float, intent: str, pos:
         return f"⚠️ ПОКУПКА {symbol} НЕ ПРОШЛА\n\nBybit отклонил ордер: {e.ret_msg}"
     trading_guard.finish_order(conn, row, "accepted", order_id=result.get("orderId"), response=result)
     trading_guard.note_bot_buy(conn, symbol, stake)
+    if intent == "buy":
+        # Remembered so every later dip-rebuy tranche on this position is
+        # the same size as the entry, as validated.
+        save_advisor_state(conn, symbol, entry_stake_usdt=stake)
 
     new_pos = _refresh_ledger(conn, coin) or pos
     state = load_advisor_state(conn, symbol)
@@ -447,7 +451,19 @@ def main():
             if not args.dry_run:
                 save_advisor_state(conn, symbol, running_low=running_low)
             if add_now:
-                stake = free_usdt / max(free_slots, 1) if free_usdt >= MIN_ORDER_USDT else 0.0
+                # A dip-rebuy tranche is the SAME SIZE as the entry that
+                # opened the position - that is what dip_rebuy_study.py
+                # validated, and what slot_cap_study.py models. The
+                # earlier "free cash / free slots" version happened to
+                # agree while the numbers lined up (150 either way), but
+                # with a full book free_slots is 0 and it would have
+                # thrown the entire free balance at a single add, which
+                # nothing was ever tested at. For a position the bot did
+                # not open (the user's own coins) there is no entry stake
+                # to copy, so fall back to the free balance and let the
+                # guards trim it.
+                stake = state.get("entry_stake_usdt") or free_usdt
+                stake = min(stake, free_usdt) if free_usdt >= MIN_ORDER_USDT else 0.0
                 action = "add"
                 if executing and stake >= MIN_ORDER_USDT:
                     try:

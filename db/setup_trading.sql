@@ -154,6 +154,10 @@ ALTER TABLE advisor_state ADD COLUMN IF NOT EXISTS bot_invested_usdt DOUBLE PREC
 ALTER TABLE advisor_state ADD COLUMN IF NOT EXISTS stop_order_link_id TEXT;
 ALTER TABLE advisor_state ADD COLUMN IF NOT EXISTS stop_trigger_price DOUBLE PRECISION;
 
+-- The size of the entry that opened this position, so every dip-rebuy
+-- tranche matches it - the sizing dip_rebuy_study.py actually validated.
+ALTER TABLE advisor_state ADD COLUMN IF NOT EXISTS entry_stake_usdt DOUBLE PRECISION;
+
 
 -- ---------- E. verify ----------
 -- After running everything above, this should return one row with
