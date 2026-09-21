@@ -38,6 +38,7 @@ Usage:
     bal = get_usdt_balance()  # float or None
 """
 import json
+import time
 from pathlib import Path
 
 import psycopg2
@@ -58,23 +59,47 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 # function succeeded when called from elsewhere. Postgres itself (unlike
 # Edge Functions) runs in one FIXED region (this project's AWS eu-west-1)
 # regardless of caller, confirmed not blocked - so the actual signed Bybit
-# call now happens inside a Postgres function (bybit_wallet_balance(),
-# using pgcrypto's hmac() + pg_net) that this module invokes over the
-# same DB connection every other script already uses. See
-# project_bybit_geoblock_proxy memory for the full story of both attempts.
+# call happens inside a Postgres function (bybit_wallet_balance_start(),
+# using pgcrypto's hmac() + pg_net).
+#
+# The enqueue and the poll-for-result happen as two SEPARATE, individually
+# committed round trips (see this function below) - a first version that
+# polled net._http_response INSIDE the same function/transaction that
+# enqueued the request always timed out: pg_net's background worker only
+# sees a request once the enqueuing transaction COMMITS, so waiting for
+# the result before returning (and thus before that transaction could
+# commit) was a self-deadlock, not a speed problem. See
+# project_bybit_geoblock_proxy memory for the full story of all attempts.
+_POLL_INTERVAL_S = 0.3
+_POLL_TIMEOUT_S = 15
 
 
 def _get(path: str, params: dict) -> dict:
     conn = get_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT bybit_wallet_balance(%s, %s)", (path, json.dumps(params)))
-            result = cur.fetchone()[0]
+            cur.execute("SELECT bybit_wallet_balance_start(%s, %s)", (path, json.dumps(params)))
+            request_id = cur.fetchone()[0]
+        conn.commit()  # must commit so pg_net's worker can see the queued request
+
+        deadline = time.monotonic() + _POLL_TIMEOUT_S
+        status = body_text = None
+        while time.monotonic() < deadline:
+            with conn.cursor() as cur:
+                cur.execute("SELECT status_code, content FROM net._http_response WHERE id = %s", (request_id,))
+                row = cur.fetchone()
+            if row and row[0] is not None:
+                status, body_text = row
+                break
+            time.sleep(_POLL_INTERVAL_S)
     finally:
         conn.close()
-    if result.get("status") != 200:
-        raise RuntimeError(f"Bybit API error on GET {path} (via pg_net): {result}")
-    body = result["body"]
+
+    if status is None:
+        raise RuntimeError(f"timeout waiting for bybit response via pg_net (path={path})")
+    if status != 200:
+        raise RuntimeError(f"Bybit API error on GET {path} (via pg_net, status={status}): {body_text}")
+    body = json.loads(body_text)
     if body.get("retCode") != 0:
         raise RuntimeError(f"Bybit API error on GET {path}: {body}")
     return body["result"]

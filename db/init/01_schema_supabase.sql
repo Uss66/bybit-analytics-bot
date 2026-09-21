@@ -171,12 +171,26 @@ VALUES (1, 0) ON CONFLICT (id) DO NOTHING;
 -- connection instead of hitting Bybit directly. See
 -- project_bybit_geoblock_proxy memory for the full story.
 --
+-- IMPORTANT (found 2026-09-21, after a first version that tried to poll
+-- net._http_response for the result INSIDE this same function/
+-- transaction always timed out, even at 30s): pg_net's background worker
+-- only sees a queued request once the transaction that enqueued it
+-- COMMITS. A function that enqueues, then polls for the result before
+-- returning (i.e. before its own transaction can commit), can never see
+-- its own request complete - a self-deadlock, not a slowness problem.
+-- Fix: this function ONLY enqueues and returns the request_id
+-- immediately; the polling happens in Python (bybit_balance.py), as
+-- separate, individually-committed queries against net._http_response -
+-- exactly mirroring how the earlier ad-hoc two-step SQL Editor tests
+-- (one query to enqueue, a later separate query to check the result)
+-- worked cleanly.
+--
 -- Requires (run once, in the SQL Editor, not applied automatically by
 -- this file - it references Vault secrets that must exist first):
 --   SELECT vault.create_secret('<real key>', 'bybit_api_key', '...');
 --   SELECT vault.create_secret('<real secret>', 'bybit_api_secret', '...');
-CREATE OR REPLACE FUNCTION bybit_wallet_balance(p_path text, p_params jsonb)
-RETURNS jsonb
+CREATE OR REPLACE FUNCTION bybit_wallet_balance_start(p_path text, p_params jsonb)
+RETURNS bigint
 LANGUAGE plpgsql
 SECURITY DEFINER
 AS $$
@@ -189,9 +203,6 @@ DECLARE
     v_sign         text;
     v_url          text;
     v_request_id   bigint;
-    v_status       int;
-    v_body         text;
-    v_tries        int := 0;
 BEGIN
     SELECT decrypted_secret INTO v_api_key FROM vault.decrypted_secrets WHERE name = 'bybit_api_key';
     SELECT decrypted_secret INTO v_api_secret FROM vault.decrypted_secrets WHERE name = 'bybit_api_secret';
@@ -218,27 +229,9 @@ BEGIN
         )
     ) INTO v_request_id;
 
-    -- pg_net is async by design (doesn't block the caller's transaction) -
-    -- poll for up to ~30s - a first attempt at ~6s timed out every time
-    -- (2026-09-21), even though the same net.http_get() pattern called as
-    -- a plain top-level SELECT (not from inside a function) resolved
-    -- within ~4s in earlier ad-hoc testing - the pg_net background worker
-    -- may need longer once wrapped in a PL/pgSQL polling loop. Bybit
-    -- itself responds in well under 1s once the request actually lands.
-    LOOP
-        SELECT status_code, content INTO v_status, v_body FROM net._http_response WHERE id = v_request_id;
-        EXIT WHEN v_status IS NOT NULL OR v_tries > 60;
-        PERFORM pg_sleep(0.5);
-        v_tries := v_tries + 1;
-    END LOOP;
-
-    IF v_status IS NULL THEN
-        RETURN jsonb_build_object('status', 0, 'body', jsonb_build_object('error', 'timeout waiting for bybit response'));
-    END IF;
-
-    RETURN jsonb_build_object('status', v_status, 'body', v_body::jsonb);
+    RETURN v_request_id;
 END;
 $$;
 
-REVOKE ALL ON FUNCTION bybit_wallet_balance(text, jsonb) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION bybit_wallet_balance(text, jsonb) TO postgres;
+REVOKE ALL ON FUNCTION bybit_wallet_balance_start(text, jsonb) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION bybit_wallet_balance_start(text, jsonb) TO postgres;
