@@ -70,7 +70,8 @@ class CashPosition:
         return self.qty * price * (1 - fee)
 
 
-def simulate(close, score, sma, max_positions, fee=SPOT_TAKER_FEE, starting_cash=STARTING_CASH):
+def simulate(close, score, sma, max_positions, fee=SPOT_TAKER_FEE, starting_cash=STARTING_CASH,
+             reserve_frac=0.0):
     cash = starting_cash
     open_positions: dict[str, CashPosition] = {}
     cooldown_until = {s: None for s in SYMBOLS}
@@ -143,7 +144,12 @@ def simulate(close, score, sma, max_positions, fee=SPOT_TAKER_FEE, starting_cash
             # THE live sizing rule: split the free cash across the slots
             # still open, so the last slot gets whatever is left rather
             # than a fixed amount that may no longer fit.
-            stake = cash / free_slots
+            #
+            # `reserve_frac` holds part of the cash back instead of
+            # deploying it, which is the only way a dip-rebuy add can be
+            # afforded once every slot is full (see cash_reserve_study.py
+            # for whether that trade is worth making - it is not).
+            stake = (cash * (1 - reserve_frac)) / free_slots
             if stake < 10:  # nothing meaningful left to deploy
                 break
             open_positions[symbol] = CashPosition(symbol, ts, price, stake, fee)
@@ -173,6 +179,7 @@ def simulate(close, score, sma, max_positions, fee=SPOT_TAKER_FEE, starting_cash
         max_dd=max_dd,
         ratio=(equity.iloc[-1] / starting_cash - 1) / abs(max_dd) if max_dd < 0 else float("inf"),
         avg_stake=trades_df["spent"].mean() if len(trades_df) else float("nan"),
+        multi_tranche=int((trades_df["n_tranches"] > 1).sum()) if len(trades_df) else 0,
     ), equity, trades_df
 
 
