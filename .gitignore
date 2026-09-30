@@ -5,3 +5,4 @@ __pycache__/
 data/
 *.log
 .claude/
+scripts/.baseline.json

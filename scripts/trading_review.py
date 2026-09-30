@@ -21,7 +21,9 @@ Usage:
     python scripts/trading_review.py --days 7
 """
 import argparse
+import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import bybit_orders
 import trading_guard
@@ -32,14 +34,24 @@ from real_positions import positions as real_positions, latest_prices, reconcile
 # Момент включения автономной торговли - точка отсчёта по умолчанию.
 AUTONOMY_START = datetime(2026, 9, 21, 21, 56, tzinfo=timezone.utc)
 
-# Снимок на момент запуска, чтобы отчёт мог считать изменение, а не
-# только абсолютные числа (см. project_autonomous_trading memory).
-BASELINE_EQUITY_USDT = <сумма скрыта>
-BASELINE_POSITIONS = {
-    "BTC": dict(qty=<кол-во скрыто>, avg_cost=70280.81, stop=64658.34),
-    "BNB": dict(qty=<кол-во скрыто>, avg_cost=806.76, stop=742.22),
-    "ETH": dict(qty=<кол-во скрыто>, avg_cost=2777.74, stop=2555.52),
-}
+# Снимок на момент запуска автономии — чтобы отчёт показывал ИЗМЕНЕНИЕ,
+# а не только абсолютные числа. Лежит в локальном файле вне git
+# (scripts/.baseline.json): репозиторий публичный, а состав и размер
+# реального счёта публиковать незачем. Без файла отчёт просто не
+# показывает строки сравнения — всё остальное работает как обычно.
+BASELINE_FILE = Path(__file__).with_name(".baseline.json")
+
+
+def load_baseline() -> dict:
+    try:
+        return json.loads(BASELINE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+BASELINE = load_baseline()
+BASELINE_EQUITY_USDT = BASELINE.get("equity_usdt")
+BASELINE_POSITIONS = BASELINE.get("positions", {})
 
 
 def section(title):
@@ -131,8 +143,9 @@ def main():
               + (f"  (+ {balance['funding_usdt']:,.2f} в Funding, споту недоступны)"
                  if balance["funding_usdt"] > 1 else ""))
         print(f"  эквити (свободные + позиции по рынку): {equity:,.2f} USDT")
-        print(f"  на момент запуска автономии было: {BASELINE_EQUITY_USDT:,.2f} USDT  "
-              f"-> {equity - BASELINE_EQUITY_USDT:+,.2f} ({equity / BASELINE_EQUITY_USDT - 1:+.2%})")
+        if BASELINE_EQUITY_USDT:
+            print(f"  на момент запуска автономии было: {BASELINE_EQUITY_USDT:,.2f} USDT  "
+                  f"-> {equity - BASELINE_EQUITY_USDT:+,.2f} ({equity / BASELINE_EQUITY_USDT - 1:+.2%})")
     print(f"  реализовано всего за историю реестра: {realized_total:+,.2f} USDT")
     print(f"  нереализовано сейчас: {unrealized:+,.2f} USDT")
     print(f"  реализовано ботом за 24ч: {trading_guard.realized_pnl_24h(conn):+,.2f} USDT")

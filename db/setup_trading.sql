@@ -11,9 +11,14 @@
 --    1. Create the Bybit key first (bybit.com -> API Management ->
 --       Create New Key -> System-generated):
 --         - Read-Write
---         - "Only IPs with permissions granted": <IP скрыт>
---           (the Supabase Postgres egress IP - every order leaves from
---           there, not from your PC and not from GitHub's runners)
+--         - "Only IPs with permissions granted": your Supabase Postgres
+--           egress IP. Every order leaves from there, not from your PC and
+--           not from GitHub's runners, so that one address is the only one
+--           the key ever needs. Find it with:
+--             SELECT net.http_get('https://api.ipify.org?format=json');
+--           then read the reply out of net._http_response. Deliberately not
+--           written down here: the list of addresses a trading key accepts
+--           is a free layer of defence, and there is no reason to publish it.
 --         - Permissions: SPOT -> Trade  ONLY
 --         - Withdrawal: LEAVE UNCHECKED. With it unchecked, the worst a
 --           leaked key can do is trade badly; it can never move coins off
