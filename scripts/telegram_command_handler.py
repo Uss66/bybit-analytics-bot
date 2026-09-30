@@ -203,6 +203,53 @@ def build_reply(conn) -> str:
     return "\n".join(lines)
 
 
+def why_still_holding(conn) -> list[str]:
+    """Answers the question the bot kept provoking: "when does it actually
+    SELL?" (asked twice by 2026-09-30, after nine days with no exit).
+
+    There are two exits - the -8% stop, and the score falling to zero,
+    which sells at whatever price regardless of profit or loss. The second
+    one IS the profit-taking, and it is invisible from the outside: you
+    cannot see a score, so a long hold looks like "it only ever exits at a
+    loss". It is not: 86% of backtested exits were signal-death, averaging
+    +3.2% on train.
+
+    For most symbols the whole long thesis is one rule, `fgi_greed` (weight
+    3, 72h horizon): Fear & Greed inside the 55-80 band. So the honest
+    answer to "why still holding" is the index value and how long it has
+    been in the band, and the honest answer to "when will it sell" is
+    ~72h after it leaves. This puts both in /status."""
+    fgi = pd.read_sql("SELECT ts, value FROM fear_greed_index ORDER BY ts", conn)
+    if fgi.empty:
+        return []
+    latest = fgi.iloc[-1]
+    in_band = fgi["value"].between(55, 80)
+    streak = 0
+    for flag in in_band.iloc[::-1]:
+        if not flag:
+            break
+        streak += 1
+
+    lines = ["", f"Индекс страха и жадности: {latest['value']} "
+                 f"({'в полосе 55-80' if 55 <= latest['value'] <= 80 else 'ВНЕ полосы'}), "
+                 f"{streak}-й день подряд" if streak else
+                 f"Индекс страха и жадности: {latest['value']} — вне полосы 55-80"]
+    if streak:
+        lines.append("Пока индекс в полосе, сигнал на покупку жив и позиции держатся. "
+                     "Продажа — примерно через 72ч после того, как он выйдет из неё "
+                     "(горизонт правила fgi_greed), по рынку, независимо от прибыли или убытка.")
+        # Historical context so a long hold does not look like a malfunction.
+        grp = (in_band != in_band.shift()).cumsum()
+        runs = fgi[in_band].groupby(grp[in_band]).size()
+        if len(runs) > 5:
+            lines.append(f"Для сравнения: исторически такие серии длятся {runs.median():.0f} дн "
+                         f"(медиана), {runs.quantile(.9):.0f} дн в 90% случаев, максимум {runs.max()}.")
+    else:
+        lines.append("Сигнал fgi_greed погас — позиции будут закрыты по рынку в пределах 72ч "
+                     "с момента выхода индекса из полосы, если их не держат другие правила.")
+    return lines
+
+
 def trading_status_text(conn) -> str:
     """What the bot is allowed to do right now, and what it has done -
     the answer to "is it still running and what did it get up to while I
@@ -224,6 +271,8 @@ def trading_status_text(conn) -> str:
         f"(лимит убытка {config['max_daily_loss_usdt']:,.0f})",
         "",
     ]
+    lines.extend(why_still_holding(conn))
+
     if orders:
         lines.append(f"Ордеров за 24ч: {len(orders)}")
         for o in orders[:8]:
