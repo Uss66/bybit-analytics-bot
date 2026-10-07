@@ -55,7 +55,8 @@ import pandas as pd
 from db import get_connection
 from strategy import load_events_with_returns, generate_signals, compute_score_series
 from telegram_notify import send_alert, CHAT_ID
-from testnet_trader import MAX_POSITIONS, TREND_FILTER_SMA, NO_REAL_BALANCE_EPS
+from testnet_trader import MAX_POSITIONS, TREND_FILTER_SMA
+from real_positions import tradeable, latest_prices
 from bybit_balance import get_coin_balance
 import trading_guard
 
@@ -104,27 +105,34 @@ def compute_signal_snapshot(conn) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def count_real_positions() -> tuple[int, bool]:
+def count_real_positions(conn) -> tuple[int, bool]:
     """How many of the 7 symbols the user REALLY holds right now (Unified
     + Funding, dust-thresholded) - NOT testnet_state's paper positions,
     see module docstring for why that distinction matters here. Second
     return value is False if any lookup failed (creds missing / API
     hiccup), meaning the count is a floor, not necessarily exact -
-    callers should say so rather than presenting it as certain."""
+    callers should say so rather than presenting it as certain.
+
+    The threshold is a VALUE, not a quantity: after the 2026-10-07 ETH
+    stop fired, the 0.0000026 ETH it could not sell would otherwise have
+    had /status report three positions and no free slot, when there were
+    two and one."""
+    coins = [s.replace("USDT", "") for s in SYMBOLS]
+    prices = latest_prices(conn, coins)
     count = 0
     reliable = True
-    for symbol in SYMBOLS:
-        bal = get_coin_balance(symbol.replace("USDT", ""))
+    for coin in coins:
+        bal = get_coin_balance(coin)
         if bal is None:
             reliable = False
             continue
-        if bal >= NO_REAL_BALANCE_EPS:
+        if tradeable(bal, prices.get(coin)):
             count += 1
     return count, reliable
 
 
 def build_reply(conn) -> str:
-    open_count, balance_reliable = count_real_positions()
+    open_count, balance_reliable = count_real_positions(conn)
     snapshot = compute_signal_snapshot(conn)
     # entry-eligible = score>0 AND above its own trend filter, matching
     # testnet_trader.py's actual entry condition exactly (a positive score

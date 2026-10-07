@@ -67,7 +67,8 @@ import bybit_orders
 import trading_guard
 from bybit_balance import get_full_balance
 from db import get_connection
-from real_positions import positions as real_positions, fetch_spot_executions, upsert_executions
+from real_positions import (positions as real_positions, fetch_spot_executions,
+                            upsert_executions, last_exit)
 from strategy import load_events_with_returns, generate_signals, compute_score_series
 from telegram_notify import send_alert
 from testnet_trader import (
@@ -78,7 +79,6 @@ from testnet_trader import (
 )
 
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "BNBUSDT", "LINKUSDT"]
-DUST = 1e-8
 MIN_ORDER_USDT = 10.0     # below this Bybit spot will not take the order anyway
 REMIND_HOURS = 6          # re-send a standing recommendation at most this often
 
@@ -127,10 +127,16 @@ def market_frame(conn, symbol: str, events: pd.DataFrame):
 
 
 def settle_closed_position(conn, symbol: str, state: dict, pos: dict | None):
-    """A position the user has sold (real qty back to zero) still has to
-    feed the post-loss cooldown, exactly as a simulated exit would. The
-    realized P&L comes from the ledger, so it reflects the price the user
-    actually got - not an assumed exit at the signal's close."""
+    """A position that is no longer held (sold by the user, or by the
+    exchange-side stop firing) still has to feed the post-loss cooldown,
+    exactly as a simulated exit would. The realized P&L comes from the
+    ledger, so it reflects the price actually obtained - not an assumed
+    exit at the signal's close.
+
+    Also drops the stop-order bookkeeping: the order is gone from the
+    exchange either way (it triggered, or it was cancelled before the
+    manual sale), and a stale link id here makes the next tick think the
+    new position is already protected."""
     realized_now = pos["realized_pnl"] if pos else 0.0
     delta = realized_now - (state["last_realized_pnl"] or 0.0)
     losses = state["consecutive_losses"] or 0
@@ -143,8 +149,49 @@ def settle_closed_position(conn, symbol: str, state: dict, pos: dict | None):
     elif delta > 0:
         losses = 0
     save_advisor_state(conn, symbol, consecutive_losses=losses, cooldown_until_ts=cooldown_until,
-                       last_realized_pnl=realized_now, running_low=None, tranche_count=0)
+                       last_realized_pnl=realized_now, running_low=None, tranche_count=0,
+                       bot_invested_usdt=0.0, entry_stake_usdt=None,
+                       stop_order_link_id=None, stop_trigger_price=None)
     return delta
+
+
+def closed_text(symbol: str, delta: float, exit_info: dict | None, cooldown_until) -> str:
+    """The exchange-side stop is the bot's PRIMARY protection, so when it
+    fires the position is gone without this process placing a single
+    order. Before 2026-10-07 that produced no message at all: the ETH stop
+    triggered at 13:02, the position closed at a loss, and the only thing
+    that reached Telegram was a confusing "sale did not go through" more
+    than four hours later. An exit is the single most important event to
+    report."""
+    by_stop = bool(exit_info and exit_info["by_bot_stop"])
+    head = "СТОП СРАБОТАЛ НА БИРЖЕ" if by_stop else "ПОЗИЦИЯ ЗАКРЫТА"
+    lines = [f"\U0001F535 {head} — {symbol}", ""]
+    if by_stop:
+        lines.append(f"Биржа сама исполнила стоп-ордер бота по ≈{_fmt(exit_info['price'])} USDT "
+                     f"({exit_info['ts']:%d.%m %H:%M} UTC) — без участия кода, как и задумано: "
+                     f"это и есть защита, которая работает во сне.")
+    elif exit_info:
+        lines.append(f"Продажа ≈{_fmt(exit_info['price'])} USDT "
+                     f"({exit_info['ts']:%d.%m %H:%M} UTC) прошла не ордером бота — "
+                     f"вручную или другим ордером.")
+    else:
+        lines.append("Монеты ушли со счёта без записанной сделки — перевод или вывод.")
+    lines += ["", f"Результат: {delta:+,.2f} USDT", "",
+              "Слот освободился, деньги вернулись в USDT — "
+              "следующий вход бот сделает по обычным правилам."]
+    if cooldown_until:
+        lines.append(f"\n⏸ Пауза по {symbol} до {cooldown_until:%d.%m %H:%M} UTC "
+                     f"(три убытка подряд).")
+    return "\n".join(lines)
+
+
+def _rejection(e: bybit_orders.OrderRejected) -> dict:
+    """Always record WHY an order was refused. `e.body` is None whenever
+    the refusal was local (a qty below the instrument minimum never
+    reaches Bybit), so storing it alone put `response` NULL in bot_orders
+    - which is how the 15 identical refusals of 2026-10-07 managed to say
+    nothing at all about their own cause."""
+    return dict(ret_code=e.ret_code, ret_msg=e.ret_msg, body=e.body)
 
 
 def _fmt(x, digits=6):
@@ -261,7 +308,7 @@ def ensure_stop_order(conn, symbol: str, pos: dict, state: dict) -> str:
     try:
         result = bybit_orders.place_stop_loss(symbol, pos["qty"], trigger, link_id, conn=conn)
     except bybit_orders.OrderRejected as e:
-        trading_guard.finish_order(conn, row, "rejected", response=e.body, pnl_usdt=None)
+        trading_guard.finish_order(conn, row, "rejected", response=_rejection(e), pnl_usdt=None)
         return (f"⚠️ стоп-ордер на бирже НЕ принят ({e.ret_msg}) — "
                 f"позиция защищена только проверкой бота раз в 15 минут")
     trading_guard.finish_order(conn, row, "accepted", order_id=result.get("orderId"), response=result)
@@ -279,7 +326,7 @@ def execute_buy(conn, symbol: str, stake: float, price: float, intent: str, pos:
     try:
         result = bybit_orders.market_buy(symbol, stake, link_id, conn=conn)
     except bybit_orders.OrderRejected as e:
-        trading_guard.finish_order(conn, row, "rejected", response=e.body)
+        trading_guard.finish_order(conn, row, "rejected", response=_rejection(e))
         return f"⚠️ ПОКУПКА {symbol} НЕ ПРОШЛА\n\nBybit отклонил ордер: {e.ret_msg}"
     trading_guard.finish_order(conn, row, "accepted", order_id=result.get("orderId"), response=result)
     trading_guard.note_bot_buy(conn, symbol, stake)
@@ -315,7 +362,7 @@ def execute_sell(conn, symbol: str, pos: dict, price: float, reason: str) -> str
     try:
         result = bybit_orders.market_sell(symbol, pos["qty"], link_id, conn=conn)
     except bybit_orders.OrderRejected as e:
-        trading_guard.finish_order(conn, row, "rejected", response=e.body)
+        trading_guard.finish_order(conn, row, "rejected", response=_rejection(e))
         return (f"⚠️ ПРОДАЖА {symbol} НЕ ПРОШЛА\n\nBybit отклонил ордер: {e.ret_msg}\n"
                 f"Позиция всё ещё открыта — посмотри вручную.")
     trading_guard.finish_order(conn, row, "accepted", order_id=result.get("orderId"),
@@ -371,7 +418,10 @@ def main():
         funding_note = (f"\n⚠️ Ещё {balance['funding_usdt']:,.2f} USDT лежит в Funding — "
                         f"для спота их надо перевести в Unified.")
 
-    held = {s for s in symbols if (book.get(s.replace("USDT", "")) or {}).get("qty", 0) > DUST}
+    # positions() has already zeroed anything too small to trade, so there
+    # is no second threshold here - one definition of "a position exists",
+    # in the ledger that owns it.
+    held = {s for s in symbols if (book.get(s.replace("USDT", "")) or {}).get("qty", 0) > 0}
     free_slots = max(0, (args.max_positions or len(symbols)) - len(held))
     print(f"Real book: {sorted(held) or 'empty'} | free USDT {free_usdt:,.2f} | free slots {free_slots}")
 
@@ -407,9 +457,12 @@ def main():
         if not holding:
             if state["last_realized_pnl"] is not None and pos and \
                     pos["realized_pnl"] != state["last_realized_pnl"] and not args.dry_run:
+                exit_info = last_exit(conn, coin)
                 delta = settle_closed_position(conn, symbol, state, pos)
                 print(f"[{symbol}] position closed on the exchange, realized {delta:+,.2f} USDT")
                 state = load_advisor_state(conn, symbol)
+                log(conn, symbol, score, False, "settled_closed", f"realized {delta:+,.2f} USDT")
+                send_alert(closed_text(symbol, delta, exit_info, state["cooldown_until_ts"]))
 
             cd = state["cooldown_until_ts"]
             if cd is not None and datetime.now(timezone.utc) < cd:
@@ -430,7 +483,16 @@ def main():
         # an add that moved the average) is a position with no protection
         # between ticks, which is the whole thing this is meant to prevent.
         if executing and not state.get("stop_order_link_id"):
-            print(f"[{symbol}] no resting stop - placing one: {ensure_stop_order(conn, symbol, pos, state)}")
+            note = ensure_stop_order(conn, symbol, pos, state)
+            print(f"[{symbol}] no resting stop - placing one: {note}")
+            # A stop the exchange refused used to be visible only in the CI
+            # log, which nobody reads at 03:00 - i.e. the one state this
+            # whole mechanism exists to prevent was also the quietest.
+            if note.startswith("\U000026A0") and should_alert(state, "stop_missing"):
+                send_alert(f"{note}\n\n{symbol}: {pos['qty']:,.8g} на "
+                           f"{pos['qty'] * price:,.2f} USDT без биржевого стопа.")
+                save_advisor_state(conn, symbol, last_action="stop_missing",
+                                   last_alert_ts=datetime.now(timezone.utc))
             state = load_advisor_state(conn, symbol)
 
         if price / pos["avg_cost"] - 1 <= STOP_LOSS:

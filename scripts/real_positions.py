@@ -56,6 +56,25 @@ SIGNED_SQL_FN = "bybit_wallet_balance_start"
 QUOTE = "USDT"
 STOP_LOSS = -0.08  # keep in sync with testnet_trader.STOP_LOSS
 
+# A remainder worth less than this is NOT a position, because Bybit will
+# not accept a spot order below minOrderAmt = 5 USDT (checked 2026-10-07:
+# same 5 for all seven pairs). So such a remainder can neither be sold
+# nor protected by a stop - calling it a position only makes the bot
+# attempt both every tick and get rejected every time.
+#
+# This has to be a VALUE, not a quantity. A coin-unit threshold cannot be
+# right for seven coins at once - 1e-8 BTC and 1e-8 DOGE differ by five
+# orders of magnitude in money - and that is exactly how the ETH stop of
+# 2026-10-07 left 0.00000264 ETH (0.0068 USDT) behind and had the bot
+# retrying a dust sale for hours.
+#
+# Measured against the remaining COST BASIS, which the ledger knows
+# without a price lookup. The one blind spot: a position that cost 6 USDT
+# and then halved is worth under 5 and would still be called a position.
+# That error direction is the safe one - it keeps reporting a holding
+# that really is there instead of silently zeroing one.
+DUST_USDT = 5.0
+
 # Bybit caps a single spot execution query at a 7-day window.
 SPOT_WINDOW_DAYS = 7
 DEFAULT_BACKFILL_DAYS = 180
@@ -207,16 +226,73 @@ def positions(conn, coin: str | None = None) -> dict[str, dict]:
             pos["n_sells"] += 1
 
     for pos in book.values():
-        # dust left by rounding is not a position - treat it as closed
-        if pos["qty"] <= 1e-10:
+        # Dust left by rounding is not a position - treat it as closed.
+        # Every exit leaves some: the sell is floored to the lot step, so
+        # the sub-step remainder can never be sold. See DUST_USDT.
+        if pos["qty"] <= 0 or pos["invested"] < DUST_USDT:
+            # Kept, not discarded: the coins are still on the exchange, so
+            # reconcile() has to expect them or it reports a phantom
+            # withdrawal.
+            pos["dust_qty"] = pos["qty"]
             pos["qty"] = 0.0
             pos["invested"] = 0.0
             pos["avg_cost"] = None
             pos["stop_price"] = None
         else:
+            pos["dust_qty"] = 0.0
             pos["avg_cost"] = pos["invested"] / pos["qty"]
             pos["stop_price"] = pos["avg_cost"] * (1 + STOP_LOSS)
     return book
+
+
+def tradeable(qty: float | None, price: float | None) -> bool:
+    """Is this balance a position, or an unsellable remainder?
+
+    The question only has a meaningful answer in money, which is why this
+    takes a price: every exit leaves a sub-lot-step remainder behind, and
+    `qty > 1e-8` calls 0.0000026 ETH a position just as readily as it
+    would 0.0000026 BTC. See DUST_USDT.
+
+    An unknown price returns True on purpose: a balance that cannot be
+    valued must never be silently treated as nothing."""
+    if not qty or qty <= 0:
+        return False
+    if price is None:
+        return True
+    return qty * price >= DUST_USDT
+
+
+def last_exit(conn, coin: str) -> dict | None:
+    """Who actually closed the position, read from the fills themselves.
+
+    Deliberately NOT read from the bot's own advisor_state: on 2026-10-07
+    the ETH exchange stop fired, and the failed dust-sale that followed
+    cleared the stop bookkeeping before anything had reported the exit -
+    so the bot's state no longer knew that its own stop was the cause.
+    The exchange, by contrast, stamps every fill with the orderLinkId and
+    stopOrderType that produced it, and those cannot be clobbered.
+
+    Groups by orderId because one market order fills in many pieces (the
+    ETH stop came back as six)."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT max(ts) AS ts, sum(qty) AS qty, sum(quote_qty) AS quote,
+                   max(raw->>'orderLinkId')   AS link_id,
+                   max(raw->>'stopOrderType') AS stop_type,
+                   max(raw->>'orderId')       AS order_id
+            FROM real_executions
+            WHERE coin = %s AND side = 'SELL'
+            GROUP BY raw->>'orderId'
+            ORDER BY max(ts) DESC
+            LIMIT 1
+        """, (coin,))
+        row = cur.fetchone()
+    if not row or not row[1]:
+        return None
+    ts, qty, quote, link_id, stop_type, order_id = row
+    return dict(ts=ts, qty=qty, quote=quote, price=quote / qty,
+                link_id=link_id, stop_type=stop_type, order_id=order_id,
+                by_bot_stop=bool(stop_type) and str(link_id or "").startswith("BOT-"))
 
 
 def latest_prices(conn, coins) -> dict[str, float]:
@@ -255,11 +331,16 @@ def reconcile(conn, book: dict[str, dict]) -> dict[str, dict]:
         if real is None:
             out[coin] = dict(ledger_qty=ledger, real_qty=None, drift=None, drift_pct=None)
             continue
-        drift = real - ledger
-        if abs(drift) <= max(1e-8, ledger * 1e-6):
+        # The unsellable remainder of a closed position is still physically
+        # on the exchange, so the balance legitimately exceeds the ledger
+        # quantity by exactly that much. Expecting it keeps a normal exit
+        # from looking like coins leaving without a record.
+        expected = ledger + pos.get("dust_qty", 0.0)
+        drift = real - expected
+        if abs(drift) <= max(1e-8, expected * 1e-6):
             continue
         out[coin] = dict(ledger_qty=ledger, real_qty=real, drift=drift,
-                          drift_pct=drift / ledger if ledger else None)
+                          drift_pct=drift / expected if expected else None)
     return out
 
 

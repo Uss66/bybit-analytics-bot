@@ -80,9 +80,7 @@ from strategy import (
 )
 from telegram_notify import send_alert
 from bybit_balance import get_full_balance, get_coin_balance
-from real_positions import alert_block
-
-NO_REAL_BALANCE_EPS = 1e-8  # below this, treat the real coin balance as "nothing to sell"
+from real_positions import alert_block, tradeable
 
 # 2026-09-22: since live_advisor.py now owns every message the user acts
 # on (it reasons about the REAL position, this script about a simulated
@@ -351,7 +349,7 @@ def maybe_add_tranche(conn, client, mode: str, symbol: str, state: dict, price: 
     # real to add to; an unverifiable balance (None) still sends, so a
     # transient API hiccup never silently hides a real signal.
     real_balance = get_coin_balance(symbol.replace("USDT", ""))
-    if real_balance is not None and real_balance < NO_REAL_BALANCE_EPS:
+    if real_balance is not None and not tradeable(real_balance, price):
         print(f"[{symbol}] add alert suppressed - no real position to add to ({real_balance})")
     else:
         send_trade_alert(_add_alert_text(symbol, fill_price, fill_qty, new_avg_cost, new_tranche_count,
@@ -513,7 +511,7 @@ def process_symbol(conn, client, mode: str, symbol: str, events: pd.DataFrame, d
     # silently hides a real signal. Entry alerts are NEVER suppressed this
     # way - "time to buy" is actionable regardless of current holdings.
     real_balance = get_coin_balance(symbol.replace("USDT", ""))
-    if real_balance is not None and real_balance < NO_REAL_BALANCE_EPS:
+    if real_balance is not None and not tradeable(real_balance, exit_price):
         print(f"[{symbol}] exit alert suppressed - no real balance to sell ({real_balance})")
     else:
         send_trade_alert(_exit_alert_text(symbol, exit_price, exit_reason, net_ret, mode,
