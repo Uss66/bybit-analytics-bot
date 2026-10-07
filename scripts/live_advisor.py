@@ -460,8 +460,16 @@ def main():
         holding = symbol in held
 
         if not holding:
-            if state["last_realized_pnl"] is not None and pos and \
-                    pos["realized_pnl"] != state["last_realized_pnl"] and not args.dry_run:
+            # Float equality is not a test for money. The ledger computes
+            # -12.269311438494682 and Postgres hands it back as
+            # -12.2693114384947, so "has realized P&L changed?" was
+            # permanently true: once the ETH exit became reachable
+            # (2026-10-07) it re-settled and re-sent the exit message
+            # every single tick. A cent is the smallest move that can
+            # mean a position was closed.
+            realized_now = pos["realized_pnl"] if pos else 0.0
+            moved = abs(realized_now - (state["last_realized_pnl"] or 0.0)) >= 0.01
+            if state["last_realized_pnl"] is not None and pos and moved and not args.dry_run:
                 exit_info = last_exit(conn, coin)
                 delta = settle_closed_position(conn, symbol, state, pos)
                 print(f"[{symbol}] position closed on the exchange, realized {delta:+,.2f} USDT")
