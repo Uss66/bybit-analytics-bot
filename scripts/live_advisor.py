@@ -316,8 +316,13 @@ def ensure_stop_order(conn, symbol: str, pos: dict, state: dict) -> str:
     return f"стоп-ордер выставлен на бирже: {_fmt(trigger)} USDT"
 
 
-def execute_buy(conn, symbol: str, stake: float, price: float, intent: str, pos: dict | None) -> str:
-    """Buy, then immediately protect. Returns the text to send."""
+def execute_buy(conn, symbol: str, stake: float, price: float, intent: str,
+                pos: dict | None) -> tuple[bool, str]:
+    """Buy, then immediately protect. Returns (filled, text to send).
+
+    The flag is not decoration: the caller counts dip-rebuy tranches, and
+    counting an attempt that never reached the exchange is what silently
+    spent BNB's whole add budget without a single add (2026-10-07)."""
     coin = symbol.replace("USDT", "")
     link_id = bybit_orders.make_link_id(symbol, intent)
     row = trading_guard.record_order(conn, symbol, intent, link_id,
@@ -327,7 +332,7 @@ def execute_buy(conn, symbol: str, stake: float, price: float, intent: str, pos:
         result = bybit_orders.market_buy(symbol, stake, link_id, conn=conn)
     except bybit_orders.OrderRejected as e:
         trading_guard.finish_order(conn, row, "rejected", response=_rejection(e))
-        return f"⚠️ ПОКУПКА {symbol} НЕ ПРОШЛА\n\nBybit отклонил ордер: {e.ret_msg}"
+        return False, f"⚠️ ПОКУПКА {symbol} НЕ ПРОШЛА\n\nBybit отклонил ордер: {e.ret_msg}"
     trading_guard.finish_order(conn, row, "accepted", order_id=result.get("orderId"), response=result)
     trading_guard.note_bot_buy(conn, symbol, stake)
     if intent == "buy":
@@ -340,7 +345,7 @@ def execute_buy(conn, symbol: str, stake: float, price: float, intent: str, pos:
     stop_note = ensure_stop_order(conn, symbol, new_pos, state) if new_pos else "позиция ещё не видна в реестре"
     head = "КУПЛЕНО" if intent == "buy" else "ДОКУПЛЕНО НА ОТСКОКЕ"
     avg_line = (f"Средняя цена позиции: {_fmt(new_pos['avg_cost'])} USDT\n" if new_pos else "")
-    return (
+    return True, (
         f"\U00002705 {head} — {symbol}\n\n"
         f"Потрачено: {stake:,.2f} USDT по цене ≈{_fmt(price)}\n"
         f"{avg_line}"
@@ -527,10 +532,11 @@ def main():
                 stake = state.get("entry_stake_usdt") or free_usdt
                 stake = min(stake, free_usdt) if free_usdt >= MIN_ORDER_USDT else 0.0
                 action = "add"
+                filled = False
                 if executing and stake >= MIN_ORDER_USDT:
                     try:
                         stake = trading_guard.check_order(conn, config, stake)
-                        text = execute_buy(conn, symbol, stake, price, "add", pos)
+                        filled, text = execute_buy(conn, symbol, stake, price, "add", pos)
                     except trading_guard.TradingBlocked as e:
                         action = "add_blocked"
                         text = (f"\U000026A0 ДОКУПКА {symbol} пропущена\n\n{e}\n\n"
@@ -538,7 +544,22 @@ def main():
                 else:
                     text = add_text(symbol, price, stake, pos, tranches + 1)
                 if not args.dry_run:
-                    save_advisor_state(conn, symbol, tranche_count=tranches + 1, running_low=price)
+                    # The counter spends the dip-rebuy budget (max 2 adds),
+                    # so only a tranche that actually reached the exchange
+                    # may advance it. Advising an add that no order
+                    # followed - no free USDT, a stake under the minimum, a
+                    # guard refusal - used to count all the same, which is
+                    # how BNB arrived at 3 tranches having added once and
+                    # could then never dip-rebuy again.
+                    #
+                    # running_low resets either way: the dip that triggered
+                    # this has been acted on as far as it is going to be,
+                    # and leaving the old low in place would re-fire the
+                    # same signal on the very next tick.
+                    fields = dict(running_low=price)
+                    if filled:
+                        fields["tranche_count"] = tranches + 1
+                    save_advisor_state(conn, symbol, **fields)
             else:
                 log(conn, symbol, score, True, "hold",
                     f"avg {pos['avg_cost']:.6g}, stop {pos['stop_price']:.6g}, price {price:.6g}")
@@ -576,8 +597,8 @@ def main():
                 # 80 of the 120 the sizing rule wanted) - a smaller trade is
                 # a fine outcome, silently skipping the signal is not.
                 stake = trading_guard.check_order(conn, config, stake)
-                text = execute_buy(conn, symbol, stake, c["price"], "buy", None)
-                action = "buy_executed"
+                filled, text = execute_buy(conn, symbol, stake, c["price"], "buy", None)
+                action = "buy_executed" if filled else "buy_rejected"
             except trading_guard.TradingBlocked as e:
                 action = "buy_blocked"
                 text = (f"\U000026A0 ВХОД {symbol} пропущен\n\n{e}\n\n"
