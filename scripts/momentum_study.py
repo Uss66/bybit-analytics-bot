@@ -84,7 +84,21 @@ def momentum(close, hours):
     return (cf / cf.shift(hours) - 1).values
 
 
+def breadth_below(close, sma):
+    """Share of the coins that have a trend at all and trade below their own
+    SMA720 right now. Forward-filled closes so one missing candle does not
+    flip a coin's state; a coin without a full-enough SMA is not counted
+    either way, rather than being assumed 'above'."""
+    cf = close.ffill()
+    valid = sma.notna() & cf.notna()
+    below = (cf < sma) & valid
+    return (below.sum(axis=1) / valid.sum(axis=1).clip(lower=1)).values
+
+
 def simulate(close, score, sma, variant, fee=SPOT_TAKER_FEE, starting_cash=STARTING_CASH):
+    """Optional regime keys (all default off, so every earlier variant is
+    unchanged): breadth_x plus any of no_entries / no_adds / defensive.
+    They act while the share of coins under their SMA720 is >= breadth_x."""
     cash = starting_cash
     open_positions: dict[str, CashPosition] = {}
     cooldown_until = {s: None for s in SYMBOLS}
@@ -98,8 +112,10 @@ def simulate(close, score, sma, variant, fee=SPOT_TAKER_FEE, starting_cash=START
     mark_v = close.ffill().values
     drop_v = momentum(close, variant["drop_h"]) if "drop_h" in variant else None
     surge_v = momentum(close, variant["surge_h"]) if "surge_h" in variant else None
+    breadth = breadth_below(close, sma) if "breadth_x" in variant else None
 
     for row, ts in enumerate(close.index):
+        regime_on = breadth is not None and breadth[row] >= variant["breadth_x"] - 1e-9
         for symbol in list(open_positions):
             i = col[symbol]
             price = close_v[row, i]
@@ -113,11 +129,13 @@ def simulate(close, score, sma, variant, fee=SPOT_TAKER_FEE, starting_cash=START
             if drop_v is not None and not np.isnan(drop_v[row, i]):
                 crash = drop_v[row, i] <= -variant["drop_x"]
 
-            if hit_stop or signal_dead or crash:
+            regime_exit = regime_on and variant.get("defensive", False)
+
+            if hit_stop or signal_dead or crash or regime_exit:
                 proceeds = pos.proceeds(price, fee)
                 cash += proceeds
                 ret = proceeds / pos.spent - 1
-                reason = "stop" if hit_stop else ("signal" if signal_dead else "crash")
+                reason = ("stop" if hit_stop else "signal" if signal_dead else "crash" if crash else "regime")
                 trades.append(dict(symbol=symbol, entry_ts=pos.entry_ts, exit_ts=ts, spent=pos.spent,
                                    ret=ret, pnl=proceeds - pos.spent, exit_reason=reason,
                                    hours=(ts - pos.entry_ts).total_seconds() / 3600))
@@ -136,7 +154,8 @@ def simulate(close, score, sma, variant, fee=SPOT_TAKER_FEE, starting_cash=START
             pos.running_low = min(pos.running_low, price)
             surge_adds = getattr(pos, "surge_adds", 0)
             dip_adds = pos.n_tranches - 1 - surge_adds
-            if dip_adds < DIP_REBUY_MAX_ADDS and cash >= pos.tranche_cash:
+            adds_blocked = regime_on and variant.get("no_adds", False)
+            if dip_adds < DIP_REBUY_MAX_ADDS and cash >= pos.tranche_cash and not adds_blocked:
                 dip = pos.running_low / pos.avg_cost - 1
                 bounce = price / pos.running_low - 1
                 if dip <= DIP_REBUY_THRESHOLD and bounce >= DIP_REBUY_REBOUND:
@@ -152,7 +171,7 @@ def simulate(close, score, sma, variant, fee=SPOT_TAKER_FEE, starting_cash=START
 
         candidates = []
         for symbol in SYMBOLS:
-            if symbol in open_positions:
+            if symbol in open_positions or (regime_on and variant.get("no_entries", False)):
                 continue
             i = col[symbol]
             price, sc, trend = close_v[row, i], score_v[row, i], sma_v[row, i]
