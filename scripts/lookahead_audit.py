@@ -65,14 +65,17 @@ def hourly_close(conn):
     return pd.DataFrame(frames)
 
 
-def build_panel(conn, close_by_sym, events, shift_cats=(), drop_cats=(), shift_hours=24):
+def build_panel(conn, close_by_sym, events, shift_cats=(), drop_cats=(), shift_hours=24, include_lookahead=False):
+    """include_lookahead=True brings back the four DVOL / DXY rules that were taken out of the live
+    score (strategy.LOOKAHEAD_RULES) - needed to reproduce variants A-C. Since 2026-10-15 the default
+    score (and so every study's load_panel) is the honest one, variant D."""
     ev = events[~events["category"].isin(drop_cats)].copy()
     m = ev["category"].isin(shift_cats)
     ev.loc[m, "ts"] = ev.loc[m, "ts"] + pd.Timedelta(hours=shift_hours)
     close, score, sma = {}, {}, {}
     for s in SYMBOLS:
         o = pd.DataFrame({"ts": close_by_sym[s].index, "close": close_by_sym[s].values})
-        o["score"] = compute_score_series(generate_signals(ev, s), o)
+        o["score"] = compute_score_series(generate_signals(ev, s, include_lookahead=include_lookahead), o)
         o["sma"] = o["close"].rolling(TREND_FILTER_SMA, min_periods=TREND_FILTER_SMA // 3).mean()
         o = o.set_index("ts")
         close[s], score[s], sma[s] = o["close"], o["score"], o["sma"]
@@ -150,10 +153,10 @@ def main():
     # ---------------- 3. portfolio ----------------
     print("\n=== 3. ПОРТФЕЛЬ (тот же движок, комиссия 0,18%): доходность / просадка / ret-dd ===")
     variants = {
-        "A как в бэктесте": dict(),
-        "B DVOL и DXY с D+1": dict(shift_cats=DVOL_CATS + DXY_CATS),
-        "C B и FGI с D+1": dict(shift_cats=DVOL_CATS + DXY_CATS + FGI_CATS),
-        "D без DVOL и DXY": dict(drop_cats=DVOL_CATS + DXY_CATS),
+        "A как в бэктесте": dict(include_lookahead=True),
+        "B DVOL и DXY с D+1": dict(include_lookahead=True, shift_cats=DVOL_CATS + DXY_CATS),
+        "C B и FGI с D+1": dict(include_lookahead=True, shift_cats=DVOL_CATS + DXY_CATS + FGI_CATS),
+        "D без DVOL и DXY": dict(),          # since 2026-10-15 this is simply the live score
     }
     panels = {k: build_panel(conn, close_by_sym, events, **v) for k, v in variants.items()}
     conn.close()

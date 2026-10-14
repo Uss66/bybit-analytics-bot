@@ -202,6 +202,37 @@ AVOID_RULES = [
     ),
 ]
 
+# Taken OUT of the live score 2026-10-15 - these four rules look into the future.
+#
+# Their inputs are DAILY bars (DVOL, DXY) stamped 00:00 UTC of day D whose close
+# is the end-of-D value. The classifiers turned "close_D / close_{D-1} - 1" into
+# an event stamped at that same 00:00, and compute_score_series activates a rule
+# from its event stamp - so the backtest knew from the first hour of day D how
+# the day ended. The live bot cannot. Measured in scripts/lookahead_audit.py:
+#   * DVOL / DXY daily change correlates with BTC's return the SAME day
+#     (-0.16 train, -0.54 holdout for DVOL) and not with the next day's, while
+#     FGI shows the reverse (correlates with the PREVIOUS day) and is clean;
+#   * dvol_drop_extreme's next-24h effect is +0.84% (t=5.2) measured from the
+#     stamp, +0.12% (t=0.7) measured from the end of the bar;
+#   * portfolio with the rules, honestly timed, +64% train / -12% holdout;
+#     without them +292% / +9% (max drawdown -7%) vs +235% / +32% as built.
+# In the live bot the DVOL rule was already inert (nine events since 2026-09-20,
+# none ever moved a live score) and DXY acted only occasionally (ETH/SOL scored
+# 5.0 on 2026-09-21..25), so removing them changed no decision in 2026-09-30..10-14:
+# the logged live score and the score without these rules matched on 10,190 of
+# 10,190 rows.
+#
+# The rationale strings above are kept as written - they record why the rules
+# were added and what the (leaking) numbers were. Do NOT re-add a rule built
+# from a daily bar without stamping it at the bar's END (D+1 00:00) and checking
+# same-day vs next-day correlation first. generate_signals(...,
+# include_lookahead=True) rebuilds the old score for audits only.
+_LOOKAHEAD_RULE_NAMES = {"dxy_up_extreme", "dxy_down_extreme", "dvol_drop_extreme", "dvol_spike_extreme"}
+LOOKAHEAD_RULES = [r for r in RULES if r["name"] in _LOOKAHEAD_RULE_NAMES]
+LOOKAHEAD_AVOID_RULES = [r for r in AVOID_RULES if r["name"] in _LOOKAHEAD_RULE_NAMES]
+RULES = [r for r in RULES if r["name"] not in _LOOKAHEAD_RULE_NAMES]
+AVOID_RULES = [r for r in AVOID_RULES if r["name"] not in _LOOKAHEAD_RULE_NAMES]
+
 # Parked 2026-08-28: each of these measured a real, statistically solid
 # event-study effect (t-stats 2-11), but at their 168h hold window they're
 # active 97-100% of the backtest timeline (measured directly - see the
@@ -287,9 +318,15 @@ def _matches(events: pd.DataFrame, rule: dict) -> pd.Series:
     return mask
 
 
-def generate_signals(events: pd.DataFrame, symbol: str) -> pd.DataFrame:
+def generate_signals(events: pd.DataFrame, symbol: str, include_lookahead: bool = False) -> pd.DataFrame:
+    """include_lookahead=True adds back the four DVOL / DXY rules whose
+    daily bars were stamped before they closed (see LOOKAHEAD_RULES). It
+    exists only so lookahead_audit.py can reproduce the old score; nothing
+    that trades should pass it."""
     signals = []
-    for rule in RULES:
+    buy_rules = RULES + (LOOKAHEAD_RULES if include_lookahead else [])
+    avoid_rules = AVOID_RULES + (LOOKAHEAD_AVOID_RULES if include_lookahead else [])
+    for rule in buy_rules:
         if symbol not in rule["symbols"]:
             continue
         matched = events[_matches(events, rule)].copy()
@@ -298,7 +335,7 @@ def generate_signals(events: pd.DataFrame, symbol: str) -> pd.DataFrame:
         matched["action"] = "buy"
         matched["weight"] = rule["weight"]
         signals.append(matched[["ts", "rule", "hold_hours", "action", "weight"]])
-    for rule in AVOID_RULES:
+    for rule in avoid_rules:
         if symbol not in rule["symbols"]:
             continue
         matched = events[_matches(events, rule)].copy()
