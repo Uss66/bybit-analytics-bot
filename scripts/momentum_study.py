@@ -116,10 +116,26 @@ def simulate(close, score, sma, variant, fee=SPOT_TAKER_FEE, starting_cash=START
     surge_v = momentum(close, variant["surge_h"]) if "surge_h" in variant else None
     breadth = breadth_below(close, sma) if "breadth_x" in variant else None
     regime_arr = variant.get("regime_arr")        # any precomputed boolean array, aligned to close.index
+    # Every strategy parameter can be overridden per variant; the defaults
+    # are today's live values, so any variant that sets none of these runs
+    # exactly as before. *_arr keys are per-row arrays aligned to close.index
+    # (market-state scaling); the scalar keys are plain overrides.
+    stop = variant.get("stop", STOP_LOSS)
+    stop_arr = variant.get("stop_arr")            # per-row stop level, negative, replaces `stop`
+    dip_thr = variant.get("dip_thr", DIP_REBUY_THRESHOLD)
+    dip_reb = variant.get("dip_reb", DIP_REBUY_REBOUND)
+    dip_scale_arr = variant.get("dip_scale_arr")  # per-row multiplier on both dip thresholds
+    max_adds = variant.get("max_adds", DIP_REBUY_MAX_ADDS)
+    cd_losses = variant.get("cd_losses", COOLDOWN_AFTER_LOSSES)
+    cd_hours = variant.get("cd_hours", COOLDOWN_HOURS)
+    max_pos = variant.get("max_pos", MAX_POSITIONS)
+    stake_arr = variant.get("stake_arr")          # per-row stake multiplier (<= 1: never levers up)
 
     for row, ts in enumerate(close.index):
         regime_on = ((breadth is not None and breadth[row] >= variant["breadth_x"] - 1e-9)
                      or (regime_arr is not None and bool(regime_arr[row])))
+        stop_now = stop_arr[row] if stop_arr is not None else stop
+        dscale = dip_scale_arr[row] if dip_scale_arr is not None else 1.0
         for symbol in list(open_positions):
             i = col[symbol]
             price = close_v[row, i]
@@ -127,7 +143,7 @@ def simulate(close, score, sma, variant, fee=SPOT_TAKER_FEE, starting_cash=START
                 continue
             pos = open_positions[symbol]
 
-            hit_stop = price / pos.avg_cost - 1 <= STOP_LOSS
+            hit_stop = price / pos.avg_cost - 1 <= stop_now
             signal_dead = not score_v[row, i] > 0
             crash = False
             if drop_v is not None and not np.isnan(drop_v[row, i]):
@@ -148,8 +164,8 @@ def simulate(close, score, sma, variant, fee=SPOT_TAKER_FEE, starting_cash=START
                     crash_block[symbol] = ts + pd.Timedelta(hours=CRASH_REENTRY_BLOCK_H)
                 if ret < 0:
                     consecutive_losses[symbol] += 1
-                    if consecutive_losses[symbol] >= COOLDOWN_AFTER_LOSSES:
-                        cooldown_until[symbol] = ts + pd.Timedelta(hours=COOLDOWN_HOURS)
+                    if consecutive_losses[symbol] >= cd_losses:
+                        cooldown_until[symbol] = ts + pd.Timedelta(hours=cd_hours)
                         consecutive_losses[symbol] = 0
                 else:
                     consecutive_losses[symbol] = 0
@@ -159,10 +175,10 @@ def simulate(close, score, sma, variant, fee=SPOT_TAKER_FEE, starting_cash=START
             surge_adds = getattr(pos, "surge_adds", 0)
             dip_adds = pos.n_tranches - 1 - surge_adds
             adds_blocked = regime_on and variant.get("no_adds", False)
-            if dip_adds < DIP_REBUY_MAX_ADDS and cash >= pos.tranche_cash and not adds_blocked:
+            if dip_adds < max_adds and cash >= pos.tranche_cash and not adds_blocked:
                 dip = pos.running_low / pos.avg_cost - 1
                 bounce = price / pos.running_low - 1
-                if dip <= DIP_REBUY_THRESHOLD and bounce >= DIP_REBUY_REBOUND:
+                if dip <= dip_thr * dscale and bounce >= dip_reb * dscale:
                     pos.add(price, pos.tranche_cash, fee)
                     cash -= pos.tranche_cash
                     continue
@@ -191,10 +207,10 @@ def simulate(close, score, sma, variant, fee=SPOT_TAKER_FEE, starting_cash=START
         candidates.sort(key=lambda c: -c[0])
 
         for sc, symbol, price in candidates:
-            free_slots = MAX_POSITIONS - len(open_positions)
+            free_slots = max_pos - len(open_positions)
             if free_slots <= 0:
                 break
-            stake = cash / free_slots
+            stake = cash / free_slots * (stake_arr[row] if stake_arr is not None else 1.0)
             if stake < 10:
                 break
             open_positions[symbol] = CashPosition(symbol, ts, price, stake, fee)
