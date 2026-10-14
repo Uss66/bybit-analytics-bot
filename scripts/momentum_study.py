@@ -97,8 +97,10 @@ def breadth_below(close, sma):
 
 def simulate(close, score, sma, variant, fee=SPOT_TAKER_FEE, starting_cash=STARTING_CASH):
     """Optional regime keys (all default off, so every earlier variant is
-    unchanged): breadth_x plus any of no_entries / no_adds / defensive.
-    They act while the share of coins under their SMA720 is >= breadth_x."""
+    unchanged): either breadth_x (share of coins under their SMA720) or
+    regime_arr (any precomputed boolean array aligned to close.index),
+    combined with any of no_entries / no_adds / defensive. They act while
+    the regime is on."""
     cash = starting_cash
     open_positions: dict[str, CashPosition] = {}
     cooldown_until = {s: None for s in SYMBOLS}
@@ -113,9 +115,11 @@ def simulate(close, score, sma, variant, fee=SPOT_TAKER_FEE, starting_cash=START
     drop_v = momentum(close, variant["drop_h"]) if "drop_h" in variant else None
     surge_v = momentum(close, variant["surge_h"]) if "surge_h" in variant else None
     breadth = breadth_below(close, sma) if "breadth_x" in variant else None
+    regime_arr = variant.get("regime_arr")        # any precomputed boolean array, aligned to close.index
 
     for row, ts in enumerate(close.index):
-        regime_on = breadth is not None and breadth[row] >= variant["breadth_x"] - 1e-9
+        regime_on = ((breadth is not None and breadth[row] >= variant["breadth_x"] - 1e-9)
+                     or (regime_arr is not None and bool(regime_arr[row])))
         for symbol in list(open_positions):
             i = col[symbol]
             price = close_v[row, i]
