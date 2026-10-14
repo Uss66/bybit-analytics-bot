@@ -220,21 +220,33 @@ def buy_text(symbol, score, price, stake, free_usdt, funding_note):
     )
 
 
-def add_text(symbol, price, stake, pos, tranche_no):
+def add_text(symbol, price, stake, pos, tranche_no, autonomous=False):
     coin = symbol.replace("USDT", "")
     projected_avg = ((pos["invested"] + stake) / (pos["qty"] + stake / price)) if stake else pos["avg_cost"]
+    # "the action is yours" is true only when the bot is advising. While it
+    # trades on its own, an unfunded add is the bot telling you it WANTED
+    # to add and could not - saying the action is the user's would send
+    # them off to do by hand something the bot has deliberately not done.
+    no_funds = ("Свободных USDT на докупку нет — всё уже вложено. Бот докупит сам, "
+                "когда средства освободятся; вручную ничего делать не нужно."
+                if autonomous else
+                "Свободных USDT на докупку не хватает — сигнал фиксирую, действие за тобой.")
+    funded = bool(stake and stake >= MIN_ORDER_USDT)
     size_line = (f"Сколько докупать: **{stake:,.2f} USDT** (≈{stake / price:,.6g} {coin})"
-                 if stake and stake >= MIN_ORDER_USDT
-                 else "Свободных USDT на докупку не хватает — сигнал фиксирую, действие за тобой.")
+                 if funded else no_funds)
+    # The projection only means something for an add that can happen. With
+    # a zero stake it printed "average will become <the same average>",
+    # which reads as a promise the bot is not going to keep.
+    projection = (f"\n\nПосле докупки средняя станет ≈{_fmt(projected_avg)} USDT, "
+                  f"стоп −8% сместится на ≈{_fmt(projected_avg * (1 + STOP_LOSS))} USDT — "
+                  f"докупка на просадке отодвигает стоп дальше от цены, а не поджимает его."
+                  if funded else "")
     return (
         f"\U0001F53C ДОКУПКА НА ОТСКОКЕ (транш {tranche_no}) — {symbol}\n\n"
         f"Цена просела от твоей средней и подтверждённо отскочила.\n"
         f"Цена сейчас: {_fmt(price)} USDT\n"
         f"Твоя средняя: {_fmt(pos['avg_cost'])} USDT, держишь {pos['qty']:,.8g} {coin}\n\n"
-        f"{size_line}\n\n"
-        f"После докупки средняя станет ≈{_fmt(projected_avg)} USDT, "
-        f"стоп −8% сместится на ≈{_fmt(projected_avg * (1 + STOP_LOSS))} USDT — "
-        f"докупка на просадке отодвигает стоп дальше от цены, а не поджимает его."
+        f"{size_line}{projection}"
     )
 
 
@@ -550,7 +562,7 @@ def main():
                         text = (f"\U000026A0 ДОКУПКА {symbol} пропущена\n\n{e}\n\n"
                                 f"Сигнал на докупку был, лимиты не дали его исполнить.")
                 else:
-                    text = add_text(symbol, price, stake, pos, tranches + 1)
+                    text = add_text(symbol, price, stake, pos, tranches + 1, autonomous=executing)
                 if not args.dry_run:
                     # The counter spends the dip-rebuy budget (max 2 adds),
                     # so only a tranche that actually reached the exchange
