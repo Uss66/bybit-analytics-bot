@@ -282,6 +282,24 @@ def _refresh_ledger(conn, coin: str) -> dict | None:
     return real_positions(conn, coin).get(coin)
 
 
+def _held_qty(conn, symbol: str, ledger_qty: float) -> float:
+    """The ledger's quantity capped at what the Unified wallet really holds.
+    The ledger can sit a hair above the wallet (fee/rounding residue); an
+    order for more than the wallet holds is rejected as 'Insufficient
+    balance', which left the BTC sell failing every tick for hours."""
+    coin = symbol.replace("USDT", "")
+    try:
+        result = bybit_orders._signed_get(
+            "/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": coin}, conn=conn)
+        for account in result.get("list", []):
+            for c in account.get("coin", []):
+                if c.get("coin") == coin:
+                    return min(ledger_qty, float(c.get("walletBalance") or 0))
+    except Exception as e:
+        print(f"[{symbol}] could not read the wallet balance, using the ledger quantity: {e}")
+    return ledger_qty
+
+
 def cancel_stop_order(conn, symbol: str, state: dict) -> None:
     """A resting stop must never outlive the position it protects: left
     behind, it would one day sell coins the bot no longer manages."""
@@ -314,11 +332,12 @@ def ensure_stop_order(conn, symbol: str, pos: dict, state: dict) -> str:
         cancel_stop_order(conn, symbol, state)
 
     link_id = bybit_orders.make_link_id(symbol, "stop")
-    request = dict(symbol=symbol, qty=pos["qty"], trigger=trigger)
+    qty = _held_qty(conn, symbol, pos["qty"])
+    request = dict(symbol=symbol, qty=qty, trigger=trigger)
     row = trading_guard.record_order(conn, symbol, "stop_order", link_id, request,
                                      reason=f"-8% of real avg {pos['avg_cost']:.6g}")
     try:
-        result = bybit_orders.place_stop_loss(symbol, pos["qty"], trigger, link_id, conn=conn)
+        result = bybit_orders.place_stop_loss(symbol, qty, trigger, link_id, conn=conn)
     except bybit_orders.OrderRejected as e:
         trading_guard.finish_order(conn, row, "rejected", response=_rejection(e), pnl_usdt=None)
         return (f"⚠️ стоп-ордер на бирже НЕ принят ({e.ret_msg}) — "
@@ -373,13 +392,16 @@ def execute_sell(conn, symbol: str, pos: dict, price: float, reason: str) -> str
 
     intent = "sell_stop" if reason == "stop_loss" else "sell_signal"
     link_id = bybit_orders.make_link_id(symbol, intent)
-    pnl = (price - pos["avg_cost"]) * pos["qty"]
+    qty = _held_qty(conn, symbol, pos["qty"])
+    pnl = (price - pos["avg_cost"]) * qty
     row = trading_guard.record_order(conn, symbol, intent, link_id,
-                                     dict(symbol=symbol, qty=pos["qty"], price=price), reason=reason)
+                                     dict(symbol=symbol, qty=qty, price=price), reason=reason)
     try:
-        result = bybit_orders.market_sell(symbol, pos["qty"], link_id, conn=conn)
+        result = bybit_orders.market_sell(symbol, qty, link_id, conn=conn)
     except bybit_orders.OrderRejected as e:
         trading_guard.finish_order(conn, row, "rejected", response=_rejection(e))
+        # The stop was cancelled above to free the coins; a failed sale must not leave the position bare.
+        ensure_stop_order(conn, symbol, pos, load_advisor_state(conn, symbol))
         return (f"⚠️ ПРОДАЖА {symbol} НЕ ПРОШЛА\n\nBybit отклонил ордер: {e.ret_msg}\n"
                 f"Позиция всё ещё открыта — посмотри вручную.")
     trading_guard.finish_order(conn, row, "accepted", order_id=result.get("orderId"),
@@ -392,7 +414,7 @@ def execute_sell(conn, symbol: str, pos: dict, price: float, reason: str) -> str
     return (
         f"\U00002705 ПРОДАНО — {symbol}\n\n"
         f"Причина: {reason_ru}\n"
-        f"Продано {pos['qty']:,.8g} {coin} по ≈{_fmt(price)} USDT\n"
+        f"Продано {qty:,.8g} {coin} по ≈{_fmt(price)} USDT\n"
         f"Результат: {pnl:+,.2f} USDT ({(price / pos['avg_cost'] - 1):+.2%})\n\n"
         f"Ордер: {result.get('orderId')}"
     )
